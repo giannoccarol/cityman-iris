@@ -152,7 +152,7 @@ IrisCapture::Result IrisCapture::next(int timeoutMs, std::vector<Probe>* probes)
             LOG(ERROR) << "no frame from the iris camera in " << kFirstFrameTimeoutMs << " ms";
             return Result::kCameraError;
         }
-        Frame f;
+        Frame& f = mFrame;  // copy-assigned by waitFrame(): keeps its capacity
         const int waitMs = int(std::min<int64_t>((deadline - now) / kMsNs + 1, 500));
         if (!mCamera.waitFrame(mLastSeq, waitMs, &f)) {
             if (mInterrupted) return Result::kInterrupted;
@@ -177,7 +177,12 @@ IrisCapture::Result IrisCapture::next(int timeoutMs, std::vector<Probe>* probes)
 
         if (frameDark(f.timestampNs, skew, exposure, pulses)) {
             mDarkMean = f.meanY;
-            if (mSubtract) mDark = f;
+            if (mSubtract) {
+                mDark.y.assign(f.y.begin(), f.y.end());
+                mDark.width = f.width;
+                mDark.height = f.height;
+                mDark.timestampNs = f.timestampNs;
+            }
         }
         // The callback comes 55-68 ms after the timestamp: the lit frame is recognised by its
         // timestamp, not by arrival order. Frames next to it are partly lit and ignored.
@@ -213,6 +218,15 @@ IrisCapture::Result IrisCapture::next(int timeoutMs, std::vector<Probe>* probes)
             continue;
         }
         mLit++;
+        // Copy-assign: the buffers keep their capacity, no allocation per frame.
+        mLastLit.y.assign(f.y.begin(), f.y.end());
+        mLastLit.width = f.width;
+        mLastLit.height = f.height;
+        mLastLit.timestampNs = f.timestampNs;
+        mLastLit.exposureNs = f.exposureNs;
+        mLastLit.skewNs = f.skewNs;
+        mLastLit.meanY = f.meanY;
+        mLastLit.sequence = f.sequence;
         process(f, probes);
         adapt(*probes, f.meanY);
         return Result::kProbes;

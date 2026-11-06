@@ -125,6 +125,16 @@ bool IrisCamera::open(int exposureUs, int iso, std::string* error) {
         close();
         return false;
     }
+    ACameraMetadata* chars = nullptr;
+    if (ACameraManager_getCameraCharacteristics(mManager, mCameraId.c_str(), &chars) ==
+        ACAMERA_OK) {
+        ACameraMetadata_const_entry e{};
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_ORIENTATION, &e) == ACAMERA_OK &&
+            e.count) {
+            mSensorOrientation = e.data.i32[0];
+        }
+        ACameraMetadata_free(chars);
+    }
     camera_status_t rc =
             ACameraManager_openCamera(mManager, mCameraId.c_str(), &mDeviceCallbacks, &mDevice);
     if (rc != ACAMERA_OK) {
@@ -292,6 +302,14 @@ void IrisCamera::onImageAvailable(void* ctx, AImageReader* reader) {
         AImage_getTimestamp(image, &ts) == AMEDIA_OK && data && w > 0 && h > 0 &&
         stride >= w && int64_t(len) >= int64_t(stride) * (h - 1) + w) {
         Frame f;
+        {
+            std::lock_guard<std::mutex> lock(self->mFrameLock);
+            if (!self->mPool.empty()) {
+                f = std::move(self->mPool.back());
+                self->mPool.pop_back();
+            }
+        }
+        f.exposureNs = f.skewNs = 0;
         f.width = w;
         f.height = h;
         f.timestampNs = ts;
@@ -310,7 +328,10 @@ void IrisCamera::onImageAvailable(void* ctx, AImageReader* reader) {
         self->lookupMeta(&f);
         f.sequence = ++self->mSequence;
         self->mQueue.push_back(std::move(f));
-        while (self->mQueue.size() > kQueueFrames) self->mQueue.pop_front();
+        while (self->mQueue.size() > kQueueFrames) {
+            self->mPool.push_back(std::move(self->mQueue.front()));
+            self->mQueue.pop_front();
+        }
         self->mFrameCond.notify_all();
     }
     AImage_delete(image);

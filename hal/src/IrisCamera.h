@@ -59,6 +59,8 @@ class IrisCamera {
     void interrupt();
     bool failed() const { return mError.load(); }
     const std::string& cameraId() const { return mCameraId; }
+    // ACAMERA_SENSOR_ORIENTATION of the iris camera (clockwise degrees), 90 if unknown.
+    int sensorOrientation() const { return mSensorOrientation; }
     int64_t framesReceived() const { return mSequence.load(); }
 
   private:
@@ -95,10 +97,12 @@ class IrisCamera {
     AImageReader_ImageListener mListener{};
 
     std::string mCameraId;
+    int mSensorOrientation = 90;
 
     std::mutex mFrameLock;
     std::condition_variable mFrameCond;
     std::deque<Frame> mQueue;
+    std::vector<Frame> mPool;  // recycled frames: no 2 MB allocation per image
     std::deque<Meta> mMeta;
     bool mInterrupted = false;
     std::atomic<bool> mError{false};

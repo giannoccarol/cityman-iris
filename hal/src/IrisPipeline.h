@@ -50,6 +50,9 @@ class IrisCapture {
     // Waits for the next processed lit frame (or timeout / interrupt / failure).
     Result next(int timeoutMs, std::vector<Probe>* probes);
     std::string stats() const;
+    // The frame behind the last kProbes result (valid until the next call of next()).
+    const Frame& lastLit() const { return mLastLit; }
+    int sensorOrientation() const { return mCamera.sensorOrientation(); }
 
   private:
     void scheduleAfter(const Frame& f);
@@ -82,6 +85,8 @@ class IrisCapture {
     int64_t mExposureSeenNs = 0;  // last exposure reported by a result
     float mDarkMean = -1.f;
     Frame mDark;
+    Frame mLastLit;
+    Frame mFrame;  // reused by next()
 
     // Counters for dumpsys / logs.
     int mPulses = 0, mLit = 0, mRejectedDim = 0, mMissed = 0, mProcessed = 0;
