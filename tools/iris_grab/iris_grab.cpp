@@ -37,13 +37,15 @@
 #include <mutex>
 #include <string>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
 
 namespace {
 
-const char *kLed = "/sys/class/leds/led:torch_0/brightness";
+char kLed[64] = "/sys/class/leds/led:torch_0/brightness";
 const int kLedMaxMa = 200;
 const int kBlack = 64;
 
@@ -79,7 +81,29 @@ struct Options {
     int warmup = 15;
     std::string out = "/data/local/tmp/iris_grab";
     bool colour = false;
+    int led_channel = 0;
+    // Pulse mode (-p ON,OFF,TOTAL ms): LED pulse train during the preview stream, no burst;
+    // per-frame row-band brightness and pulse times are written to frames.csv / pulses.csv.
+    int pulse_on_ms = 0, pulse_off_ms = 0, pulse_total_ms = 0;
+    // Frame-locked mode (-S K,TOTAL ms): light one whole frame every K frames, timing the pulse
+    // from the previous frame's timestamp, frame duration and rolling shutter skew.
+    int sync_k = 0;
 };
+
+struct FrameStat {
+    int64_t ts;
+    double band[16];
+};
+
+struct PulseTimes {
+    int64_t on_before, on_after, off_before, off_after;  // CLOCK_BOOTTIME ns around each write
+};
+
+int64_t boottime_ns() {
+    timespec t{};
+    clock_gettime(CLOCK_BOOTTIME, &t);
+    return int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
+}
 
 struct FrameMeta {
     int64_t exposure_ns = 0;
@@ -97,6 +121,11 @@ struct State {
     int failed = 0;
     std::map<int64_t, FrameMeta> meta;  // keyed by sensor timestamp
     std::vector<int64_t> raw_ts, yuv_ts;
+    std::vector<FrameStat> frame_stats;
+    int64_t last_ts = 0, max_cb_latency = 0, sum_cb_latency = 0;
+    int n_cb = 0;
+    std::vector<PulseTimes> pulses;
+    int64_t frame_duration_ns = 0, skew_ns = 0;
 };
 
 State gS;
@@ -210,11 +239,59 @@ void on_raw(void *, AImageReader *r) {
     }
 }
 
+void frame_stat(AImage *img, int64_t ts) {
+    uint8_t *data = nullptr;
+    int len = 0, stride = 0;
+    int32_t w = 0, h = 0;
+    AImage_getWidth(img, &w);
+    AImage_getHeight(img, &h);
+    if (AImage_getPlaneData(img, 0, &data, &len) != AMEDIA_OK ||
+        AImage_getPlaneRowStride(img, 0, &stride) != AMEDIA_OK)
+        return;
+    FrameStat fs{};
+    fs.ts = ts;
+    int64_t lat = boottime_ns() - ts;
+    for (int b = 0; b < 16; b++) {
+        int y0 = h * b / 16, y1 = h * (b + 1) / 16;
+        double sum = 0;
+        long n = 0;
+        for (int y = y0; y < y1; y += 2)
+            for (int x = 0; x < w; x += 8) {
+                sum += data[size_t(y) * stride + x];
+                n++;
+            }
+        fs.band[b] = n ? sum / n : 0;
+    }
+    std::lock_guard<std::mutex> l(gS.m);
+    gS.frame_stats.push_back(fs);
+    gS.last_ts = ts;
+    gS.max_cb_latency = std::max(gS.max_cb_latency, lat);
+    gS.sum_cb_latency += lat;
+    gS.n_cb++;
+    gS.cv.notify_all();
+}
+
+void sleep_until_boottime(int64_t t) {
+    timespec ts{};
+    ts.tv_sec = t / 1000000000LL;
+    ts.tv_nsec = t % 1000000000LL;
+    while (clock_nanosleep(CLOCK_BOOTTIME, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
+    }
+}
+
 void on_yuv(void *, AImageReader *r) {
     AImage *img = nullptr;
     if (AImageReader_acquireNextImage(r, &img) != AMEDIA_OK || !img) return;
     int64_t ts = 0;
     AImage_getTimestamp(img, &ts);
+    if (gS.opt.pulse_total_ms > 0) {
+        frame_stat(img, ts);
+        AImage_delete(img);
+        std::lock_guard<std::mutex> l(gS.m);
+        gS.yuv_seen++;
+        gS.cv.notify_all();
+        return;
+    }
     int idx = -1;
     {
         std::lock_guard<std::mutex> l(gS.m);
@@ -240,6 +317,10 @@ void cap_completed(void *, ACameraCaptureSession *, ACaptureRequest *, const ACa
     if (ACameraMetadata_getConstEntry(res, ACAMERA_SENSOR_SENSITIVITY, &e) == ACAMERA_OK && e.count) fm.iso = e.data.i32[0];
     if (ACameraMetadata_getConstEntry(res, ACAMERA_SENSOR_TIMESTAMP, &e) == ACAMERA_OK && e.count) fm.timestamp = e.data.i64[0];
     std::lock_guard<std::mutex> l(gS.m);
+    if (ACameraMetadata_getConstEntry(res, ACAMERA_SENSOR_FRAME_DURATION, &e) == ACAMERA_OK && e.count)
+        gS.frame_duration_ns = e.data.i64[0];
+    if (ACameraMetadata_getConstEntry(res, ACAMERA_SENSOR_ROLLING_SHUTTER_SKEW, &e) == ACAMERA_OK && e.count)
+        gS.skew_ns = e.data.i64[0];
     gS.meta[fm.timestamp] = fm;
 }
 
@@ -282,8 +363,8 @@ bool start_binder_pool() {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: iris_grab [-c ID] [-n FRAMES] [-e EXPOSURE_US] [-i ISO] [-l LED_MA (<=%d)] [-w WARMUP]\n"
-                 "                 [-o OUTDIR] [-x (keep colour pipeline)]\n",
+                 "usage: iris_grab [-c ID] [-n FRAMES] [-e EXPOSURE_US] [-i ISO] [-l LED_MA (<=%d)] [-L 0|1] [-w WARMUP]\n"
+                 "                 [-p ON_MS,OFF_MS,TOTAL_MS (pulse mode)] [-S K,TOTAL_MS (frame-locked pulses)] [-o OUTDIR] [-x (keep colour pipeline)]\n",
                  kLedMaxMa);
     return 2;
 }
@@ -293,7 +374,7 @@ int usage() {
 int main(int argc, char **argv) {
     Options &o = gS.opt;
     int c;
-    while ((c = getopt(argc, argv, "c:n:e:i:l:w:o:xh")) != -1) {
+    while ((c = getopt(argc, argv, "c:n:e:i:l:L:p:S:w:o:xh")) != -1) {
         switch (c) {
             case 'c': o.id = optarg; break;
             case 'n': o.frames = std::atoi(optarg); break;
@@ -303,11 +384,28 @@ int main(int argc, char **argv) {
             case 'w': o.warmup = std::atoi(optarg); break;
             case 'o': o.out = optarg; break;
             case 'x': o.colour = true; break;
+            case 'L': o.led_channel = std::atoi(optarg); break;
+            case 'S':
+                if (std::sscanf(optarg, "%d,%d", &o.sync_k, &o.pulse_total_ms) != 2 || o.sync_k < 2 || o.sync_k > 30)
+                    return usage();
+                o.pulse_on_ms = 1;
+                o.pulse_off_ms = 99;
+                break;
+            case 'p':
+                if (std::sscanf(optarg, "%d,%d,%d", &o.pulse_on_ms, &o.pulse_off_ms, &o.pulse_total_ms) != 3) return usage();
+                break;
             default: return usage();
         }
     }
     if (o.frames < 1 || o.frames > 30 || o.led_ma < 0 || o.led_ma > kLedMaxMa || o.warmup < 0 || o.warmup > 120)
         return usage();
+    if (o.led_channel != 0 && o.led_channel != 1) return usage();
+    // Pulse limits of the Windows driver envelope: on <= 70 ms, duty <= 35 %, train <= 4 s.
+    if (o.pulse_total_ms > 0 && (o.pulse_on_ms < 1 || o.pulse_on_ms > 70 || o.pulse_off_ms < 1 ||
+                                 o.pulse_on_ms * 100 > 35 * (o.pulse_on_ms + o.pulse_off_ms) ||
+                                 o.pulse_total_ms > 4000 || o.led_ma < 1))
+        return usage();
+    std::snprintf(kLed, sizeof kLed, "/sys/class/leds/led:torch_%d/brightness", o.led_channel);
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGHUP, on_signal);
@@ -385,7 +483,7 @@ int main(int argc, char **argv) {
     ACaptureRequest_addTarget(still, yuv_t);
     setup(still);
 
-    if (o.led_ma > 0) {
+    if (o.led_ma > 0 && o.pulse_total_ms == 0) {
         gLedOn = true;
         led_write(o.led_ma);
     }
@@ -393,8 +491,95 @@ int main(int argc, char **argv) {
     ccb.onCaptureCompleted = cap_completed;
     ccb.onCaptureFailed = cap_failed;
     int seq = 0;
-    st = ACameraCaptureSession_setRepeatingRequest(sess, nullptr, 1, &prev, &seq);
+    st = ACameraCaptureSession_setRepeatingRequest(sess, &ccb, 1, &prev, &seq);
     if (st != ACAMERA_OK) return std::fprintf(stderr, "setRepeatingRequest: %d\n", st), 1;
+
+    if (o.pulse_total_ms > 0) {
+        {
+            std::unique_lock<std::mutex> l(gS.m);
+            gS.cv.wait_for(l, std::chrono::seconds(4), [] { return gS.yuv_seen >= gS.opt.warmup; });
+        }
+        int64_t start = boottime_ns(), end = start + int64_t(o.pulse_total_ms) * 1000000;
+        gLedOn = true;
+        const int64_t margin = 2000000, exp_ns = (o.exposure_us > 0 ? o.exposure_us : 20000) * 1000;
+        int64_t next_target = 0;
+        while (o.sync_k > 0 && boottime_ns() < end) {
+            int64_t last, fd, skew;
+            {
+                std::unique_lock<std::mutex> l(gS.m);
+                gS.cv.wait_for(l, std::chrono::milliseconds(200));
+                last = gS.last_ts;
+                fd = gS.frame_duration_ns;
+                skew = gS.skew_ns;
+            }
+            if (!last || !fd) continue;
+            int64_t now = boottime_ns();
+            // First frame start that is far enough in the future and K frames after the last pulse.
+            int64_t t = last + fd;
+            while (t - margin < now + 1000000 || (next_target && t < next_target - fd / 2)) t += fd;
+            int64_t off_at = t + skew + exp_ns + margin;
+            if (off_at - (t - margin) > 70000000LL) {
+                std::fprintf(stderr, "pulse would exceed 70 ms\n");
+                break;
+            }
+            sleep_until_boottime(t - margin);
+            PulseTimes p{};
+            p.on_before = boottime_ns();
+            led_write(o.led_ma);
+            p.on_after = boottime_ns();
+            sleep_until_boottime(off_at);
+            p.off_before = boottime_ns();
+            led_write(0);
+            p.off_after = boottime_ns();
+            gS.pulses.push_back(p);
+            next_target = t + int64_t(o.sync_k) * fd;
+        }
+        while (o.sync_k == 0 && boottime_ns() < end) {
+            PulseTimes p{};
+            p.on_before = boottime_ns();
+            led_write(o.led_ma);
+            p.on_after = boottime_ns();
+            usleep(o.pulse_on_ms * 1000);
+            p.off_before = boottime_ns();
+            led_write(0);
+            p.off_after = boottime_ns();
+            gS.pulses.push_back(p);
+            usleep(o.pulse_off_ms * 1000);
+        }
+        led_off();
+        usleep(300000);
+        ACameraCaptureSession_stopRepeating(sess);
+        usleep(200000);
+        std::lock_guard<std::mutex> l(gS.m);
+        std::string fp = o.out + "/frames.csv", pp = o.out + "/pulses.csv";
+        if (FILE *f = std::fopen(fp.c_str(), "w")) {
+            std::fprintf(f, "# frame_duration_ns %lld rolling_skew_ns %lld exposure_us %lld\nts", (long long)gS.frame_duration_ns,
+                         (long long)gS.skew_ns, (long long)o.exposure_us);
+            for (int b = 0; b < 16; b++) std::fprintf(f, ",b%d", b);
+            std::fprintf(f, "\n");
+            for (auto &fs : gS.frame_stats) {
+                std::fprintf(f, "%lld", (long long)fs.ts);
+                for (int b = 0; b < 16; b++) std::fprintf(f, ",%.2f", fs.band[b]);
+                std::fprintf(f, "\n");
+            }
+            std::fclose(f);
+        }
+        if (FILE *f = std::fopen(pp.c_str(), "w")) {
+            std::fprintf(f, "on_before,on_after,off_before,off_after\n");
+            for (auto &p : gS.pulses)
+                std::fprintf(f, "%lld,%lld,%lld,%lld\n", (long long)p.on_before, (long long)p.on_after,
+                             (long long)p.off_before, (long long)p.off_after);
+            std::fclose(f);
+        }
+        std::printf("callback latency mean %.1f ms max %.1f ms\n", gS.n_cb ? gS.sum_cb_latency / 1e6 / gS.n_cb : 0.0,
+                    gS.max_cb_latency / 1e6);
+        std::printf("pulse mode: %zu frames, %zu pulses (%d mA, ch %d), frame %lld ns, skew %lld ns -> %s\n",
+                    gS.frame_stats.size(), gS.pulses.size(), o.led_ma, o.led_channel, (long long)gS.frame_duration_ns,
+                    (long long)gS.skew_ns, o.out.c_str());
+        ACameraCaptureSession_close(sess);
+        ACameraDevice_close(dev);
+        return 0;
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     {
