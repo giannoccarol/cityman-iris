@@ -1,0 +1,53 @@
+// cityman iris recognition engine (vendor). Not built yet: written for the cityman LineageOS 23
+// tree, verified only with the host CMake build.
+
+cc_defaults {
+    name: "libcitymaniris_engine_defaults",
+    vendor: true,
+    srcs: [
+        "src/image.cpp",
+        "src/segment.cpp",
+        "src/encode.cpp",
+        "src/iris_api.cpp",
+    ],
+    export_include_dirs: ["include"],
+    local_include_dirs: ["src"],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-O2",
+        "-fvisibility=hidden",
+    ],
+    // Allocation failures are reported as IRIS_E_NO_MEMORY instead of aborting.
+    cppflags: ["-fexceptions"],
+}
+
+cc_library_shared {
+    name: "libcitymaniris_engine",
+    defaults: ["libcitymaniris_engine_defaults"],
+}
+
+cc_library_static {
+    name: "libcitymaniris_engine_static",
+    defaults: ["libcitymaniris_engine_defaults"],
+}
+
+// Optional tools (not in PRODUCT_PACKAGES by default).
+cc_binary {
+    name: "citymaniris_cli",
+    vendor: true,
+    srcs: ["tools/iris_cli.cpp"],
+    local_include_dirs: ["src"],
+    static_libs: ["libcitymaniris_engine_static"],
+    cflags: ["-Wall", "-Wextra"],
+}
+
+cc_test {
+    name: "citymaniris_engine_tests",
+    vendor: true,
+    gtest: false,
+    srcs: ["tests/unit_tests.cpp"],
+    local_include_dirs: ["src"],
+    static_libs: ["libcitymaniris_engine_static"],
+    cflags: ["-Wall", "-Wextra"],
+}
