@@ -1,2 +1,3 @@
-# Tuning knobs of the iris face HAL (persist.vendor.iris.*), clamped by the HAL itself.
+# Tuning knobs of the iris face HAL (persist.vendor.iris.*), clamped by the HAL itself, and its
+# runtime state (vendor.iris.saved_min_cpus).
 vendor_internal_prop(vendor_iris_prop)

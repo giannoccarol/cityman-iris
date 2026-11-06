@@ -29,3 +29,11 @@ allow hal_face_cityman_iris cityman_iris_data_file:file create_file_perms;
 # Tuning properties and ro.vendor.camera.mono_ids (fallback camera lookup).
 get_prop(hal_face_cityman_iris, vendor_iris_prop)
 get_prop(hal_face_cityman_iris, vendor_default_prop)
+
+# Big cores during an operation (CpuBoost): core_ctl min_cpus of the A57 cluster, the A57
+# frequency floor through perfd, and vendor.iris.saved_min_cpus for the restore after a crash.
+allow hal_face_cityman_iris sysfs_devices_system_cpu:file rw_file_perms;
+allow hal_face_cityman_iris perfd_data_file:dir search;
+allow hal_face_cityman_iris perfd_data_file:sock_file write;
+allow hal_face_cityman_iris perfd:unix_stream_socket connectto;
+set_prop(hal_face_cityman_iris, vendor_iris_prop)

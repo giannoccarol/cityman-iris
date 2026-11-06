@@ -18,3 +18,7 @@ service vendor.face-cityman /vendor/bin/hw/android.hardware.biometrics.face-serv
     # Never leave the emitter lit if the service dies mid-pulse.
     onrestart write /sys/class/leds/led:torch_0/brightness 0
     onrestart write /sys/class/leds/led:torch_1/brightness 0
+    # Put core_ctl min_cpus of the A57 cluster back if the service died while it was raised
+    # (the HAL also does it when it starts; nothing is written when the property is unset).
+    onrestart write /sys/devices/system/cpu/cpu4/core_ctl/min_cpus ${vendor.iris.saved_min_cpus}
+    onrestart setprop vendor.iris.saved_min_cpus ""

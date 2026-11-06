@@ -43,6 +43,7 @@ Face::Face() {
             std::vector<std::string>(std::begin(kLedMaxBrightnessPaths),
                                      std::end(kLedMaxBrightnessPaths)));
     if (!mCtx.sealer.init(kSealKeyPath)) LOG(ERROR) << "no template sealing key";
+    CpuBoost::recoverAtStartup();
 
     iris_config cfg;
     iris_config_default(&cfg);
@@ -58,11 +59,15 @@ Face::Face() {
         LOG(ERROR) << "inconsistent engine config, using the defaults";
         iris_engine_create(nullptr, &mCtx.engine);
     }
+    if (mCtx.engine && iris_context_create(mCtx.engine, &mCtx.engineContext) != IRIS_OK) {
+        mCtx.engineContext = nullptr;  // iris_extract_ex then allocates per call
+    }
     LOG(INFO) << "iris face HAL ready: engine API " << iris_engine_api_version() << ", "
               << mCtx.led->toString();
 }
 
 Face::~Face() {
+    iris_context_destroy(mCtx.engineContext);
     if (mCtx.engine) iris_engine_destroy(mCtx.engine);
 }
 

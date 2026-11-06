@@ -478,6 +478,11 @@ ndk::ScopedAStatus Session::close() {
 
 // ------------------------------------------------------------------------------ enrollment
 
+namespace {
+// Upper bound of an operation, for the time-limited frequency lock.
+constexpr int kOpBoostMs = kEnrollTimeoutMs + 2000;  // enrollment; authentication uses its own
+}  // namespace
+
 void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
                        const std::vector<Feature>& features,
                        std::shared_ptr<ANativeWindow> preview) {
@@ -502,7 +507,10 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
     const int32_t enrollmentId = store.newEnrollmentId();
 
     std::lock_guard<std::mutex> captureLock(mCtx->captureLock);
-    IrisCapture capture(mCtx->led.get(), mCtx->engine);
+    IrisCapture capture(mCtx->led.get(), mCtx->engine, mCtx->engineContext);
+    // Analysis on the A57 cluster, two A57 online, A57 floor ~1.25 GHz: until the end of the
+    // operation whatever the way out.
+    ScopedCpuBoost boost(mCtx->boost, kOpBoostMs);
     {
         std::lock_guard<std::mutex> lock(mLock);
         mCapture = &capture;
@@ -740,7 +748,10 @@ void Session::doAuthenticate(uint64_t opId, int64_t operationId) {
     }
 
     std::lock_guard<std::mutex> captureLock(mCtx->captureLock);
-    IrisCapture capture(mCtx->led.get(), mCtx->engine);
+    IrisCapture capture(mCtx->led.get(), mCtx->engine, mCtx->engineContext);
+    // Analysis on the A57 cluster, two A57 online, A57 floor ~1.25 GHz: until the end of the
+    // operation whatever the way out.
+    ScopedCpuBoost boost(mCtx->boost, kAuthTimeoutMs + 2000);
     {
         std::lock_guard<std::mutex> lock(mLock);
         mCapture = &capture;

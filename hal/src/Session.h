@@ -20,6 +20,7 @@
 #include <aidl/android/hardware/biometrics/face/FaceEnrollOptions.h>
 #include <aidl/android/hardware/biometrics/face/ISessionCallback.h>
 
+#include "CpuBoost.h"
 #include "IrLed.h"
 #include "PreviewSink.h"
 #include "IrisPipeline.h"
@@ -37,6 +38,8 @@ struct IrisContext {
     std::unique_ptr<cityman::iris::IrLed> led;
     cityman::iris::Sealer sealer;
     iris_engine* engine = nullptr;
+    iris_context* engineContext = nullptr;  // engine buffers, used under captureLock
+    cityman::iris::CpuBoost boost;           // used under captureLock
     std::mutex captureLock;  // one camera operation at a time
 };
 

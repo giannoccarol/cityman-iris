@@ -8,6 +8,7 @@ cc_binary {
     init_rc: ["android.hardware.biometrics.face-service.cityman.rc"],
     vintf_fragments: ["android.hardware.biometrics.face-service.cityman.xml"],
     srcs: [
+        "src/CpuBoost.cpp",
         "src/Face.cpp",
         "src/IrLed.cpp",
         "src/IrisCamera.cpp",
