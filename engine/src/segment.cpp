@@ -54,6 +54,14 @@ bool solve(int n, double *A, double *b) {
     return true;
 }
 
+// Median without a copy; reorders v (the value does not depend on the order).
+float median_inplace(std::vector<float> &v) {
+    if (v.empty()) return 0.f;
+    size_t m = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + long(m), v.end());
+    return v[m];
+}
+
 float median_of(std::vector<float> v) {
     if (v.empty()) return 0.f;
     size_t m = v.size() / 2;
@@ -193,17 +201,7 @@ void grey_close3(std::vector<uint8_t> &b, std::vector<uint8_t> &t, int w, int h)
     vpass3<false>(t.data(), b.data(), w, h);
 }
 
-struct Run {
-    int y, x0, x1;  // x1 exclusive
-    int parent;
-};
-struct Comp {
-    long area;
-    int bx0, bx1, by0, by1;
-    int first_run;
-};
-
-std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, float rmax_full) {
+std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, float rmax_full, Scratch &sc) {
     const int w = c.w, h = c.h;
     std::vector<Cand> out;
     if (w < 8 || h < 8) return out;
@@ -242,19 +240,22 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
 
     const float rmin = rmin_full / float(f), rmax = rmax_full / float(f);
     const float amin = kPi * rmin * rmin * 0.5f, amax = kPi * rmax * rmax * 1.2f;
-    std::vector<uint8_t> tmp(static_cast<size_t>(w) * h);
-    std::vector<Run> runs;
-    std::vector<size_t> row_start;
-    std::vector<Comp> comps;
-    std::vector<int> comp_of, next_run;
-    std::vector<int32_t> stack;
-    std::vector<uint8_t> box;
+    std::vector<uint8_t> &tmp = sc.ctmp;
+    tmp.resize(static_cast<size_t>(w) * h);
+    std::vector<Run> &runs = sc.runs;
+    std::vector<size_t> &row_start = sc.row_start;
+    std::vector<Comp> &comps = sc.comps;
+    std::vector<int> &comp_of = sc.comp_of, &next_run = sc.next_run;
+    std::vector<int32_t> &stack = sc.stack;
+    std::vector<uint8_t> &box = sc.box;
 
     // Threshold decomposition: the binary 3x3 opening of {c < T} equals {closing(c) < T} with the
     // grey-level closing (max then min filter), so one closing serves every threshold.
-    std::vector<uint8_t> closed(c.px);
+    std::vector<uint8_t> &closed = sc.closed;
+    closed.assign(c.px.begin(), c.px.end());
     if (rmin >= 2.f) grey_close3(closed, tmp, w, h);
-    std::vector<uint8_t> row_min(static_cast<size_t>(h), 255);
+    std::vector<uint8_t> &row_min = sc.row_min;
+    row_min.assign(static_cast<size_t>(h), 255);
     for (int y = 0; y < h; ++y) {
         const uint8_t *r = closed.data() + size_t(y) * w;
         uint8_t m = 255;
@@ -435,16 +436,6 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
 
 // ---------------------------------------------------------------- full-resolution fits
 
-struct CropCtx {
-    ImageF raw, s1, s2;  // raw, sigma 1, sigma 2
-    ImageU8 glint;       // 1 = specular reflection (dilated)
-    float glint_level = 255.f;
-    bool in_glint(float x, float y) const {
-        int xi = int(std::lround(x)), yi = int(std::lround(y));
-        return glint.inside(xi, yi) && glint.at(xi, yi);
-    }
-};
-
 struct PupilFit {
     Contour c;
     float edge = 0, valid_frac = 0, blur_sigma = 0;
@@ -603,6 +594,7 @@ bool fit_limbus(const CropCtx &cc, const Contour &pupil, float r_lo, float r_hi,
         float t = (135.f + 75.f * (float(i) + 0.5f) / float(per)) * kPi / 180.f;
         arcs.c.push_back(std::cos(t)), arcs.s.push_back(std::sin(t));
     }
+    const float pupil_max = pupil.max_radius();  // 64 trig evaluations: once, not per probe
     const float dc = std::max(2.f, std::min(0.08f * r_hi, 0.5f * pupil.a0 + 2.f));
     const float cs = dc > 6.f ? 2.f : 1.f;
     // Stage 1: radial profile around the pupil centre -> up to 3 candidate radii (local maxima).
@@ -641,7 +633,7 @@ bool fit_limbus(const CropCtx &cc, const Contour &pupil, float r_lo, float r_hi,
             for (float dx = -dc; dx <= dc + 1e-3f; dx += cstep) {
                 const float cx = pupil.cx + dx, cy = pupil.cy + dy;
                 for (float r = std::max(r_lo, pk.second - rspan); r <= std::min(r_hi, pk.second + rspan) + 1e-3f; r += 1.f) {
-                    if (std::hypot(dx, dy) + pupil.max_radius() > r - 9.f) continue;  // arcs clear of the pupil edge
+                    if (std::hypot(dx, dy) + pupil_max > r - 9.f) continue;  // arcs clear of the pupil edge
                     float o_r, o_l, i_r, i_l;
                     arc_means(cc, arcs, cx, cy, r + 2.f, o_r, o_l);
                     arc_means(cc, arcs, cx, cy, r - 2.f, i_r, i_l);
@@ -659,7 +651,7 @@ bool fit_limbus(const CropCtx &cc, const Contour &pupil, float r_lo, float r_hi,
                 const float cx = cx0p + (k == 0 ? stp : k == 1 ? -stp : 0.f);
                 const float cy = cy0p + (k == 2 ? stp : k == 3 ? -stp : 0.f);
                 const float r = r0p + (k == 4 ? stp : k == 5 ? -stp : 0.f);
-                if (std::hypot(cx - pupil.cx, cy - pupil.cy) + pupil.max_radius() > r - 9.f) continue;
+                if (std::hypot(cx - pupil.cx, cy - pupil.cy) + pupil_max > r - 9.f) continue;
                 float o_r, o_l, i_r, i_l;
                 arc_means(cc, arcs, cx, cy, r + 2.f, o_r, o_l);
                 arc_means(cc, arcs, cx, cy, r - 2.f, i_r, i_l);
@@ -694,10 +686,13 @@ Parabola fit_lid(const CropCtx &cc, const Contour &pupil, const LimbusFit &lf, b
                 double s = 0;
                 int n = 0;
                 for (float x = lf.cx - R; x <= lf.cx + R; x += 2.f) {
+                    const float dxl = (x - lf.cx) * (x - lf.cx);
+                    // The full test below is >= round(dx^2) whatever the FMA contraction: skip early.
+                    if (dxl > (R - 6.f) * (R - 6.f)) continue;
                     const float y = yv + k * (x - xv) * (x - xv);
                     if ((x - lf.cx) * (x - lf.cx) + (y - lf.cy) * (y - lf.cy) > (R - 6.f) * (R - 6.f)) continue;
                     if ((x - pupil.cx) * (x - pupil.cx) + (y - pupil.cy) * (y - pupil.cy) < pr * pr) continue;
-                    const int xi = int(std::lround(x)), ya = int(std::lround(y - 3.f)), yb = int(std::lround(y + 3.f));
+                    const int xi = iround(x), ya = iround(y - 3.f), yb = iround(y + 3.f);
                     if (!im.inside(xi, ya) || !im.inside(xi, yb)) continue;
                     if (cc.glint.at(xi, ya) || cc.glint.at(xi, yb)) continue;
                     float g = im.at(xi, ya) - im.at(xi, yb);
@@ -719,146 +714,207 @@ Parabola fit_lid(const CropCtx &cc, const Contour &pupil, const LimbusFit &lf, b
 
 }  // namespace
 
-bool segment(const iris_engine &eng, const Gray8 &g, Segmentation &seg, int &crop_x, int &crop_y,
-             ImageF &crop, ImageU8 &noise_mask, iris_status &st, ExtractDebug *dbg) {
+namespace {
+
+template <typename T>
+void reset_image(Image<T> &img, int w, int h, T v) {
+    img.w = w, img.h = h;
+    img.px.assign(size_t(w) * size_t(h), v);
+}
+
+}  // namespace
+
+bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation &seg, int &crop_x,
+             int &crop_y, iris_status &st, ExtractDebug *dbg) {
     const iris_config &cfg = eng.cfg;
+    const InputMap &m = sc.map;
     const float rmin_iris = cfg.min_iris_radius, rmax_iris = cfg.max_iris_radius;
     const float rp_min = std::max(3.f, 0.12f * rmin_iris);
     const float rp_max = 0.8f * rmax_iris;
-    int f = int(rp_min / 2.4f);
-    f = std::max(1, std::min(8, f));
-    ImageU8 coarse = downsample_box(g.img, f);
-    std::vector<Cand> cands = pupil_candidates(coarse, f, rp_min, rp_max);
-    if (dbg) {
-        for (const Cand &c : cands) {
-            dbg->cand_x.push_back(c.x + float(g.off_x));
-            dbg->cand_y.push_back(c.y + float(g.off_y));
-            dbg->cand_r.push_back(c.r);
-            dbg->cand_score.push_back(c.score);
+    // Coarse factor of the candidate search: the smallest pupil spans about 2.4 coarse pixels.
+    // (The historic int(rp_min / 2.4) gave 1 for the default config, because 4.8f / 2.4f rounds
+    // below 2: the search ran at full resolution. A factor of 4 loses small pupils.)
+    const int f = std::max(1, std::min(8, int(rp_min / 2.4f + 1e-3f)));
+    auto find = [&](int x, int y, int w, int h) {
+        std::vector<Cand> cs;
+        if (w / f < 8 || h / f < 8) return cs;
+        convert_coarse(m, f, x, y, w, h, sc.coarse, sc.rowbuf, sc.rowacc);
+        cs = pupil_candidates(sc.coarse, f, rp_min, rp_max, sc);
+        for (Cand &c : cs) c.x += float(x), c.y += float(y);
+        return cs;
+    };
+
+    bool have = false;
+    iris_status fail = IRIS_Q_NO_EYE, best_st = IRIS_OK;
+    float best_total = -1.f;
+    // Full-resolution fits of the best candidates; keeps the best segmentation in sc.best.
+    auto fit_candidates = [&](const std::vector<Cand> &cands) {
+        have = false;
+        fail = IRIS_Q_NO_EYE;
+        best_st = IRIS_OK;
+        best_total = -1.f;
+        if (dbg) {
+            dbg->cand_x.clear(), dbg->cand_y.clear(), dbg->cand_r.clear(), dbg->cand_score.clear();
+            for (const Cand &c : cands) {
+                dbg->cand_x.push_back(c.x + float(m.x0));
+                dbg->cand_y.push_back(c.y + float(m.y0));
+                dbg->cand_r.push_back(c.r);
+                dbg->cand_score.push_back(c.score);
+            }
+        }
+        const size_t ntry = std::min<size_t>(3, cands.size());
+        for (size_t ci = 0; ci < ntry; ++ci) {
+            const Cand &cd = cands[ci];
+            if (ci > 0 && cd.score < 0.25f * cands[0].score) break;
+            // another hypothesis inside an eye already segmented: same eye, skip
+            if (have && std::hypot(cd.x - float(crop_x) - seg.iris.cx, cd.y - float(crop_y) - seg.iris.cy) < seg.iris.a0) continue;
+            const float half = std::min(rmax_iris * 1.15f, std::max(cd.r / 0.12f, rmin_iris)) + 10.f;
+            const int x0 = std::max(0, int(cd.x - half)), y0 = std::max(0, int(cd.y - half));
+            const int x1 = std::min(m.w, int(cd.x + half) + 1), y1 = std::min(m.h, int(cd.y + half) + 1);
+            if (x1 - x0 < 8 || y1 - y0 < 8) continue;
+            CropCtx &cc = sc.cur;
+            convert_rect_float(m, x0, y0, x1 - x0, y1 - y0, cc.raw, sc.convtmp);
+            gaussian_blur(cc.raw, cc.s1, 1.0f, sc.blur_tmp, sc.kernel, sc.col);
+            gaussian_blur(cc.raw, cc.s2, 2.0f, sc.blur_tmp, sc.kernel, sc.col);
+            cc.glint_level = std::max(245.f, cd.ring_level + 0.6f * (255.f - cd.ring_level));  // sclera/skin reach ~230 after auto-gain
+            reset_image<uint8_t>(cc.glint, cc.raw.w, cc.raw.h, 0);
+            {
+                ImageU8 &raw_g = sc.raw_g;
+                reset_image<uint8_t>(raw_g, cc.raw.w, cc.raw.h, 0);
+                for (size_t i = 0; i < raw_g.px.size(); ++i) raw_g.px[i] = cc.raw.px[i] >= cc.glint_level;
+                for (int y = 0; y < raw_g.h; ++y)
+                    for (int x = 0; x < raw_g.w; ++x) {
+                        if (!raw_g.at(x, y)) continue;
+                        for (int dy = -2; dy <= 2; ++dy)
+                            for (int dx = -2; dx <= 2; ++dx)
+                                if (cc.glint.inside(x + dx, y + dy)) cc.glint.at(x + dx, y + dy) = 1;
+                    }
+            }
+            PupilFit pf;
+            const float lcx = cd.x - float(x0), lcy = cd.y - float(y0);
+            if (!fit_pupil(cc, lcx, lcy, cd.r, cd.in_level, cd.ring_level, pf)) continue;
+            if (fail == IRIS_Q_NO_EYE) fail = IRIS_Q_NO_IRIS;
+            const float rpm = pf.c.a0, rpx = pf.c.max_radius();
+            const float r_lo = std::max(0.6f * rmin_iris, std::max(1.2f * rpm, rpx + 9.f));  // clear of the blurred pupil edge
+            const float r_hi = std::min(rmax_iris * 1.1f, rpm / 0.12f);
+            LimbusFit lf;
+            if (!fit_limbus(cc, pf.c, r_lo, r_hi, lf)) continue;
+            if (lf.contrast < cfg.min_limbus_contrast) continue;
+            const float ratio = rpm / lf.r;
+            const float offc = std::hypot(lf.cx - pf.c.cx, lf.cy - pf.c.cy);
+            if (ratio < 0.1f || ratio > 0.85f || offc + rpx > lf.r - 1.f || lf.r >= r_hi - 0.5f) {
+                if (fail == IRIS_Q_NO_IRIS) fail = IRIS_Q_BAD_GEOMETRY;
+                continue;
+            }
+            const float total = cd.score * std::min(1.f, lf.contrast / 10.f) * pf.valid_frac;
+            if (total <= best_total) continue;
+            best_total = total;
+            have = true;
+            best_st = IRIS_OK;
+
+            Segmentation s;
+            s.pupil = pf.c;
+            s.iris = Contour();
+            s.iris.cx = lf.cx, s.iris.cy = lf.cy, s.iris.a0 = lf.r;
+            s.pupil_level = cd.in_level;
+            s.limbus_contrast = lf.contrast;
+            s.sclera_level = lf.sclera;
+            s.pupil_contrast = cd.ring_level - cd.in_level;
+            s.blur_sigma = pf.blur_sigma;
+            s.candidate_score = cd.score;
+            // glint near the pupil
+            const float gr = pf.c.max_radius() * 1.5f;
+            for (int y = int(pf.c.cy - gr); y <= int(pf.c.cy + gr) && !s.glint; ++y)
+                for (int x = int(pf.c.cx - gr); x <= int(pf.c.cx + gr); ++x)
+                    if (cc.raw.inside(x, y) && cc.raw.at(x, y) >= cc.glint_level) {
+                        s.glint = true;
+                        break;
+                    }
+            const float lid_min = std::max(2.5f, 0.5f * lf.contrast);
+            s.upper = fit_lid(cc, pf.c, lf, true, lid_min);
+            s.lower = fit_lid(cc, pf.c, lf, false, lid_min);
+
+            // Iris statistics (raw) on the unoccluded ring.
+            std::vector<float> &vals = sc.vals;
+            vals.clear();
+            ImageU8 &mask = sc.mask;
+            reset_image<uint8_t>(mask, cc.raw.w, cc.raw.h, 0);
+            // Same predicate as before, cheapest tests first; the pupil contour (atan2 + trig) is
+            // only evaluated within its upper bound.
+            const float pupil_bound = pf.c.radius_bound() + 1.5f;
+            auto in_ring = [&](float x, float y) {
+                if (std::hypot(x - lf.cx, y - lf.cy) > lf.r - 1.5f) return false;
+                if (s.upper.present && y < s.upper.y(x)) return false;
+                if (s.lower.present && y > s.lower.y(x)) return false;
+                float dp = std::hypot(x - pf.c.cx, y - pf.c.cy);
+                if (dp >= pupil_bound) return true;
+                float t = std::atan2(y - pf.c.cy, x - pf.c.cx);
+                if (dp < pf.c.radius(t) + 1.5f) return false;
+                return true;
+            };
+            const int bx0 = std::max(0, int(lf.cx - lf.r)), bx1 = std::min(cc.raw.w - 1, int(lf.cx + lf.r) + 1);
+            const int by0 = std::max(0, int(lf.cy - lf.r)), by1 = std::min(cc.raw.h - 1, int(lf.cy + lf.r) + 1);
+            // in_ring once per pixel of the bounding box (it is used by both passes below)
+            ImageU8 &ring = sc.ring;
+            const int rw = bx1 - bx0 + 1, rh = by1 - by0 + 1;
+            reset_image<uint8_t>(ring, std::max(0, rw), std::max(0, rh), 0);
+            for (int y = by0; y <= by1; ++y)
+                for (int x = bx0; x <= bx1; ++x) ring.at(x - bx0, y - by0) = in_ring(float(x), float(y)) ? 1 : 0;
+            for (int y = by0; y <= by1; ++y)
+                for (int x = bx0; x <= bx1; ++x)
+                    if (!cc.glint.at(x, y) && ring.at(x - bx0, y - by0)) vals.push_back(cc.raw.at(x, y));
+            float med = median_inplace(vals);
+            for (auto &v : vals) v = std::fabs(v - med);
+            float sd = 1.4826f * median_inplace(vals);
+            s.iris_level = med;
+            const float t_lash = std::min(med - 3.f * sd, 0.5f * (med + s.pupil_level));
+            const float t_refl = med + 0.5f * (cc.glint_level - med);
+            int nsat = 0, nring = 0;
+            for (int y = by0; y <= by1; ++y)
+                for (int x = bx0; x <= bx1; ++x) {
+                    if (!ring.at(x - bx0, y - by0)) continue;
+                    nring++;
+                    const float v = cc.raw.at(x, y);
+                    if (v >= m.sat_level) nsat++;
+                    if (v < t_lash || v > t_refl) {
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx)
+                                if (mask.inside(x + dx, y + dy)) mask.at(x + dx, y + dy) = 1;
+                    }
+                }
+            for (size_t i = 0; i < mask.px.size(); ++i) mask.px[i] |= cc.glint.px[i];
+            if (nring > 0 && float(nsat) > 0.2f * float(nring)) best_st = IRIS_Q_OVEREXPOSED;
+
+            seg = s;
+            crop_x = x0, crop_y = y0;
+            std::swap(sc.cur, sc.best);
+            std::swap(sc.mask, sc.best_mask);
+        }
+        return have;
+    };
+
+    // 1. Around the hint (the eye position in the previous frame), when given.
+    if (hint && hint->r > 0.f) {
+        const float hx = hint->x - float(m.x0), hy = hint->y - float(m.y0);
+        const float hw = 2.2f * std::max(hint->r, rmin_iris) + 16.f;
+        const int x0 = std::max(0, int(hx - hw)), y0 = std::max(0, int(hy - hw));
+        const int x1 = std::min(m.w, int(hx + hw) + 1), y1 = std::min(m.h, int(hy + hw) + 1);
+        if (x1 > x0 && y1 > y0) {
+            std::vector<Cand> cands = find(x0, y0, x1 - x0, y1 - y0);
+            if (!cands.empty() && fit_candidates(cands)) {
+                st = best_st;
+                return true;
+            }
         }
     }
+    // 2. Whole frame (or input ROI).
+    std::vector<Cand> cands = find(0, 0, m.w, m.h);
     if (cands.empty()) {
+        if (dbg) dbg->cand_x.clear(), dbg->cand_y.clear(), dbg->cand_r.clear(), dbg->cand_score.clear();
         st = IRIS_Q_NO_EYE;
         return false;
     }
-    iris_status fail = IRIS_Q_NO_EYE, best_st = IRIS_OK;
-    bool have = false;
-    float best_total = -1.f;
-    const size_t ntry = std::min<size_t>(3, cands.size());
-    for (size_t ci = 0; ci < ntry; ++ci) {
-        const Cand &cd = cands[ci];
-        if (ci > 0 && cd.score < 0.25f * cands[0].score) break;
-        // another hypothesis inside an eye already segmented: same eye, skip
-        if (have && std::hypot(cd.x - float(crop_x) - seg.iris.cx, cd.y - float(crop_y) - seg.iris.cy) < seg.iris.a0) continue;
-        const float half = std::min(rmax_iris * 1.15f, std::max(cd.r / 0.12f, rmin_iris)) + 10.f;
-        const int x0 = std::max(0, int(cd.x - half)), y0 = std::max(0, int(cd.y - half));
-        const int x1 = std::min(g.img.w, int(cd.x + half) + 1), y1 = std::min(g.img.h, int(cd.y + half) + 1);
-        if (x1 - x0 < 8 || y1 - y0 < 8) continue;
-        CropCtx cc;
-        cc.raw = to_float(g.img, x0, y0, x1 - x0, y1 - y0);
-        gaussian_blur(cc.raw, cc.s1, 1.0f);
-        gaussian_blur(cc.raw, cc.s2, 2.0f);
-        cc.glint_level = std::max(245.f, cd.ring_level + 0.6f * (255.f - cd.ring_level));  // sclera/skin reach ~230 after auto-gain
-        cc.glint = ImageU8(cc.raw.w, cc.raw.h, 0);
-        {
-            ImageU8 raw_g(cc.raw.w, cc.raw.h, 0);
-            for (size_t i = 0; i < raw_g.px.size(); ++i) raw_g.px[i] = cc.raw.px[i] >= cc.glint_level;
-            for (int y = 0; y < raw_g.h; ++y)
-                for (int x = 0; x < raw_g.w; ++x) {
-                    if (!raw_g.at(x, y)) continue;
-                    for (int dy = -2; dy <= 2; ++dy)
-                        for (int dx = -2; dx <= 2; ++dx)
-                            if (cc.glint.inside(x + dx, y + dy)) cc.glint.at(x + dx, y + dy) = 1;
-                }
-        }
-        PupilFit pf;
-        const float lcx = cd.x - float(x0), lcy = cd.y - float(y0);
-        if (!fit_pupil(cc, lcx, lcy, cd.r, cd.in_level, cd.ring_level, pf)) continue;
-        if (fail == IRIS_Q_NO_EYE) fail = IRIS_Q_NO_IRIS;
-        const float rpm = pf.c.a0, rpx = pf.c.max_radius();
-        const float r_lo = std::max(0.6f * rmin_iris, std::max(1.2f * rpm, rpx + 9.f));  // clear of the blurred pupil edge
-        const float r_hi = std::min(rmax_iris * 1.1f, rpm / 0.12f);
-        LimbusFit lf;
-        if (!fit_limbus(cc, pf.c, r_lo, r_hi, lf)) continue;
-        if (lf.contrast < cfg.min_limbus_contrast) continue;
-        const float ratio = rpm / lf.r;
-        const float offc = std::hypot(lf.cx - pf.c.cx, lf.cy - pf.c.cy);
-        if (ratio < 0.1f || ratio > 0.85f || offc + rpx > lf.r - 1.f || lf.r >= r_hi - 0.5f) {
-            if (fail == IRIS_Q_NO_IRIS) fail = IRIS_Q_BAD_GEOMETRY;
-            continue;
-        }
-        const float total = cd.score * std::min(1.f, lf.contrast / 10.f) * pf.valid_frac;
-        if (total <= best_total) continue;
-        best_total = total;
-        have = true;
-        best_st = IRIS_OK;
-
-        Segmentation s;
-        s.pupil = pf.c;
-        s.iris = Contour();
-        s.iris.cx = lf.cx, s.iris.cy = lf.cy, s.iris.a0 = lf.r;
-        s.pupil_level = cd.in_level;
-        s.limbus_contrast = lf.contrast;
-        s.sclera_level = lf.sclera;
-        s.pupil_contrast = cd.ring_level - cd.in_level;
-        s.blur_sigma = pf.blur_sigma;
-        s.candidate_score = cd.score;
-        // glint near the pupil
-        const float gr = pf.c.max_radius() * 1.5f;
-        for (int y = int(pf.c.cy - gr); y <= int(pf.c.cy + gr) && !s.glint; ++y)
-            for (int x = int(pf.c.cx - gr); x <= int(pf.c.cx + gr); ++x)
-                if (cc.raw.inside(x, y) && cc.raw.at(x, y) >= cc.glint_level) {
-                    s.glint = true;
-                    break;
-                }
-        const float lid_min = std::max(2.5f, 0.5f * lf.contrast);
-        s.upper = fit_lid(cc, pf.c, lf, true, lid_min);
-        s.lower = fit_lid(cc, pf.c, lf, false, lid_min);
-
-        // Iris statistics (raw) on the unoccluded ring.
-        std::vector<float> vals;
-        ImageU8 mask(cc.raw.w, cc.raw.h, 0);
-        auto in_ring = [&](float x, float y) {
-            float dp = std::hypot(x - pf.c.cx, y - pf.c.cy);
-            float t = std::atan2(y - pf.c.cy, x - pf.c.cx);
-            if (dp < pf.c.radius(t) + 1.5f) return false;
-            if (std::hypot(x - lf.cx, y - lf.cy) > lf.r - 1.5f) return false;
-            if (s.upper.present && y < s.upper.y(x)) return false;
-            if (s.lower.present && y > s.lower.y(x)) return false;
-            return true;
-        };
-        const int bx0 = std::max(0, int(lf.cx - lf.r)), bx1 = std::min(cc.raw.w - 1, int(lf.cx + lf.r) + 1);
-        const int by0 = std::max(0, int(lf.cy - lf.r)), by1 = std::min(cc.raw.h - 1, int(lf.cy + lf.r) + 1);
-        for (int y = by0; y <= by1; ++y)
-            for (int x = bx0; x <= bx1; ++x)
-                if (!cc.glint.at(x, y) && in_ring(float(x), float(y))) vals.push_back(cc.raw.at(x, y));
-        float m = median_of(vals);
-        for (auto &v : vals) v = std::fabs(v - m);
-        float sd = 1.4826f * median_of(vals);
-        s.iris_level = m;
-        const float t_lash = std::min(m - 3.f * sd, 0.5f * (m + s.pupil_level));
-        const float t_refl = m + 0.5f * (cc.glint_level - m);
-        int nsat = 0, nring = 0;
-        for (int y = by0; y <= by1; ++y)
-            for (int x = bx0; x <= bx1; ++x) {
-                if (!in_ring(float(x), float(y))) continue;
-                nring++;
-                const float v = cc.raw.at(x, y);
-                if (v >= g.sat_level) nsat++;
-                if (v < t_lash || v > t_refl) {
-                    for (int dy = -1; dy <= 1; ++dy)
-                        for (int dx = -1; dx <= 1; ++dx)
-                            if (mask.inside(x + dx, y + dy)) mask.at(x + dx, y + dy) = 1;
-                }
-            }
-        for (size_t i = 0; i < mask.px.size(); ++i) mask.px[i] |= cc.glint.px[i];
-        if (nring > 0 && float(nsat) > 0.2f * float(nring)) best_st = IRIS_Q_OVEREXPOSED;
-
-        seg = s;
-        crop_x = x0, crop_y = y0;
-        crop = std::move(cc.raw);
-        noise_mask = std::move(mask);
-    }
+    fit_candidates(cands);
     st = have ? best_st : fail;
     return have;
 }

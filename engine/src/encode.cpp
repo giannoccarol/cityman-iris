@@ -81,8 +81,10 @@ uint32_t compute_encoder_id(const iris_config &c) {
 void normalize_iris(const iris_engine &eng, const Segmentation &seg, const ImageF &crop,
                     const ImageU8 &noise_mask, ImageF &norm, ImageU8 &valid) {
     const int R = eng.cfg.norm_rows, C = eng.cfg.norm_cols;
-    norm = ImageF(C, R, 0.f);
-    valid = ImageU8(C, R, 0);
+    norm.w = C, norm.h = R;
+    norm.px.assign(size_t(C) * R, 0.f);  // keeps the capacity across calls
+    valid.w = C, valid.h = R;
+    valid.px.assign(size_t(C) * R, 0);
     for (int j = 0; j < C; ++j) {
         const float t = k2Pi * float(j) / float(C), ct = std::cos(t), st = std::sin(t);
         const float rp = seg.pupil.radius(t);
@@ -94,7 +96,7 @@ void normalize_iris(const iris_engine &eng, const Segmentation &seg, const Image
             bool ok;
             float v = bilinear(crop, x, y, &ok);
             if (ok) {
-                int xi = int(std::lround(x)), yi = int(std::lround(y));
+                int xi = iround(x), yi = iround(y);
                 if (noise_mask.inside(xi, yi) && noise_mask.at(xi, yi)) ok = false;
                 if (seg.upper.present && y < seg.upper.y(x)) ok = false;
                 if (seg.lower.present && y > seg.lower.y(x)) ok = false;
@@ -106,6 +108,11 @@ void normalize_iris(const iris_engine &eng, const Segmentation &seg, const Image
 }
 
 void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Code &code) {
+    Scratch::Encode buf;
+    encode(eng, norm, valid, code, buf);
+}
+
+void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Code &code, Scratch::Encode &buf) {
     const iris_config &cfg = eng.cfg;
     const int R = cfg.norm_rows, C = cfg.norm_cols, CR = cfg.code_rows, CC = cfg.code_cols;
     const int rstep = R / CR, cstep = C / CC, W = eng.layout.words, NF = cfg.n_filters;
@@ -116,12 +123,16 @@ void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Co
     for (size_t i = 0; i < norm.px.size(); ++i)
         if (valid.px[i]) gs += norm.px[i], gn++;
     const float gmean = gn ? float(gs / double(gn)) : 0.f;
-    ImageF sm(C, R);
+    ImageF &sm = buf.sm;
+    sm.w = C, sm.h = R;
+    sm.px.assign(size_t(C) * R, 0.f);
     const float sg = cfg.radial_sigma;
     const int kr = sg > 0.f ? std::max(1, int(std::ceil(2.5f * sg))) : 0;
-    std::vector<float> kw(size_t(2 * kr + 1), 1.f);
+    std::vector<float> &kw = buf.kw;
+    kw.assign(size_t(2 * kr + 1), 1.f);
     for (int d = -kr; d <= kr; ++d) kw[size_t(d + kr)] = sg > 0.f ? std::exp(-0.5f * float(d * d) / (sg * sg)) : 1.f;
-    std::vector<float> rowmean(size_t(R), gmean);
+    std::vector<float> &rowmean = buf.rowmean;
+    rowmean.assign(size_t(R), gmean);
     for (int i = 0; i < R; ++i) {
         double s = 0;
         int n = 0;
@@ -129,7 +140,8 @@ void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Co
             if (valid.at(j, i)) s += norm.at(j, i), n++;
         if (n > C / 10) rowmean[size_t(i)] = float(s / n);
     }
-    for (int i = 0; i < R; ++i)
+    // Only the rows sampled by the code (k * rstep + rstep / 2) are ever read: smooth those.
+    for (int i = rstep / 2; i < R; i += rstep)
         for (int j = 0; j < C; ++j) {
             float s = 0, w = 0;
             for (int d = -kr; d <= kr; ++d) {
@@ -143,11 +155,17 @@ void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Co
 
     code.bits.assign(size_t(CC) * size_t(W), 0);
     code.mask.assign(size_t(CC) * size_t(W), 0);
-    std::vector<std::complex<float>> spec(static_cast<size_t>(C)), resp(static_cast<size_t>(C));
+    std::vector<std::complex<float>> &spec = buf.spec, &resp = buf.resp;
+    spec.resize(size_t(C)), resp.resize(size_t(C));
     // Per filter: responses of all (row, col) for the fragile-bit quantiles.
-    std::vector<float> are, aim;
-    std::vector<uint8_t> okv(size_t(CR) * size_t(CC));
-    std::vector<float> re_all(size_t(NF) * CR * CC), im_all(size_t(NF) * CR * CC);
+    std::vector<float> &are = buf.are, &aim = buf.aim;
+    std::vector<uint8_t> &okv = buf.okv;
+    okv.assign(size_t(CR) * size_t(CC), 0);
+    std::vector<float> &re_all = buf.re_all, &im_all = buf.im_all;
+    re_all.assign(size_t(NF) * CR * CC, 0.f), im_all.assign(size_t(NF) * CR * CC, 0.f);
+    std::vector<int> &prefix = buf.prefix;
+    prefix.assign(size_t(C) + 1, 0);
+    int prefix_r0 = -1, prefix_r1 = -1;
     for (int k = 0; k < CR; ++k) {
         const int i = k * rstep + rstep / 2;
         for (int j = 0; j < C; ++j) spec[size_t(j)] = std::complex<float>(sm.at(j, i) - rowmean[size_t(i)], 0.f);
@@ -158,14 +176,32 @@ void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Co
             eng.fft.run(resp.data(), true);
             const int hw = std::max(1, int(cfg.wavelength[fi] / 4.f));
             const int r0 = std::max(0, i - rstep / 2), r1 = std::min(R - 1, i + (rstep - 1) / 2);
+            // Valid samples in the (rows r0..r1) x (columns j-hw..j+hw, circular) window, from
+            // prefix sums of the per-column counts (the same integers as the direct count).
+            if (fi == 0 || r0 != prefix_r0 || r1 != prefix_r1) {
+                prefix_r0 = r0, prefix_r1 = r1;
+                prefix[0] = 0;
+                for (int jj = 0; jj < C; ++jj) {
+                    int cnt = 0;
+                    for (int ii = r0; ii <= r1; ++ii) cnt += valid.at(jj, ii);
+                    prefix[size_t(jj) + 1] = prefix[size_t(jj)] + cnt;
+                }
+            }
+            auto colsum = [&](int a, int b) {  // columns a..b inclusive, 0 <= a <= b < C
+                return prefix[size_t(b) + 1] - prefix[size_t(a)];
+            };
             for (int jc = 0; jc < CC; ++jc) {
                 const int j = jc * cstep;
-                int nv = 0, nt = 0;
-                for (int ii = r0; ii <= r1; ++ii)
-                    for (int d = -hw; d <= hw; ++d) {
-                        nv += valid.at((j + d + C) % C, ii);
-                        nt++;
-                    }
+                const int nt = (r1 - r0 + 1) * (2 * hw + 1);
+                int nv = 0;
+                if (2 * hw + 1 >= C) {
+                    for (int d = -hw; d <= hw; ++d) nv += colsum((j + d + C) % C, (j + d + C) % C);
+                } else {
+                    const int a = j - hw, b = j + hw;
+                    if (a >= 0 && b < C) nv = colsum(a, b);
+                    else if (a < 0) nv = colsum(a + C, C - 1) + colsum(0, b);
+                    else nv = colsum(a, C - 1) + colsum(0, b - C);
+                }
                 const bool ok = valid.at(j, i) && nv * 4 >= nt * 3;
                 const size_t idx = (size_t(fi) * CR + size_t(k)) * CC + size_t(jc);
                 re_all[idx] = resp[size_t(j)].real();

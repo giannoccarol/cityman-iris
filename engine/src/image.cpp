@@ -17,7 +17,7 @@ inline int raw10_at(const uint8_t *row, int x) {
 
 }  // namespace
 
-bool convert_input(const iris_image &in, Gray8 &out) {
+bool prepare_input(const iris_image &in, InputMap &m) {
     if (!in.data || in.width <= 0 || in.height <= 0) return false;
     int bits = 8;
     size_t min_stride;
@@ -49,79 +49,173 @@ bool convert_input(const iris_image &in, Gray8 &out) {
     }
     const float full = float((1u << bits) - 1u);
     const uint8_t *base = static_cast<const uint8_t *>(in.data);
+    m.base = base;
+    m.stride = stride;
+    m.format = in.format;
+    m.maxv = int(full);
+    m.x0 = x0, m.y0 = y0, m.w = w, m.h = h;
 
     // Pass 1: histogram (1024 bins of the normalized value) on a sparse grid. Four interleaved
     // histograms keep uniform regions from serializing on a single counter.
-    std::vector<uint32_t> h4(4 * 1024, 0);
+    m.h4.assign(4 * 1024, 0);
     uint64_t count = 0;
-    const int maxv = int(full);
+    const int maxv = m.maxv;
     // bin index for every possible input code (up to 16 bits)
-    std::vector<uint16_t> bin_of(size_t(maxv) + 1);
-    for (int v = 0; v <= maxv; ++v) bin_of[size_t(v)] = uint16_t(std::min(1023, int(float(v) / full * 1023.f + 0.5f)));
-    auto value = [&](const uint8_t *row, int x) -> int {
-        switch (in.format) {
-            case IRIS_PIX_GRAY8: return row[x];
-            case IRIS_PIX_GRAY16: {
-                uint16_t v;
-                std::memcpy(&v, row + size_t(x) * 2, 2);
-                return std::min<int>(v, maxv);
-            }
-            default: return raw10_at(row, x);
-        }
-    };
+    m.bin_of.resize(size_t(maxv) + 1);
+    for (int v = 0; v <= maxv; ++v) m.bin_of[size_t(v)] = uint16_t(std::min(1023, int(float(v) / full * 1023.f + 0.5f)));
     const int step = (size_t(w) * size_t(h) > 400000u) ? 2 : 1;
+    uint32_t *h4 = m.h4.data();
+    const uint16_t *bin_of = m.bin_of.data();
     for (int y = y0; y < y0 + h; y += step) {
         const uint8_t *row = base + size_t(y) * stride;
         int k = 0;
-        for (int x = x0; x < x0 + w; x += step, ++k) h4[size_t(k & 3) * 1024 + bin_of[size_t(value(row, x))]]++;
+        switch (in.format) {
+            case IRIS_PIX_GRAY8:
+                for (int x = x0; x < x0 + w; x += step, ++k) h4[size_t(k & 3) * 1024 + bin_of[row[x]]]++;
+                break;
+            case IRIS_PIX_GRAY16:
+                for (int x = x0; x < x0 + w; x += step, ++k) {
+                    uint16_t v;
+                    std::memcpy(&v, row + size_t(x) * 2, 2);
+                    h4[size_t(k & 3) * 1024 + bin_of[std::min<int>(v, maxv)]]++;
+                }
+                break;
+            default:
+                for (int x = x0; x < x0 + w; x += step, ++k) h4[size_t(k & 3) * 1024 + bin_of[raw10_at(row, x)]]++;
+                break;
+        }
         count += uint64_t(k);
     }
-    std::vector<uint32_t> hist(1024, 0);
-    for (int b = 0; b < 1024; ++b)
-        hist[size_t(b)] = h4[size_t(b)] + h4[1024 + size_t(b)] + h4[2048 + size_t(b)] + h4[3072 + size_t(b)];
     uint64_t target = uint64_t(double(count) * 0.995), acc = 0;
     int p995 = 1023;
     for (int b = 0; b < 1024; ++b) {
-        acc += hist[size_t(b)];
+        acc += uint64_t(h4[size_t(b)]) + h4[1024 + size_t(b)] + h4[2048 + size_t(b)] + h4[3072 + size_t(b)];
         if (acc >= target) {
             p995 = b;
             break;
         }
     }
-    out.exposure = float(p995) / 1023.f;
+    m.exposure = float(p995) / 1023.f;
     // Map p99.5 to 230; never amplify more than 16x, never compress 8-bit input.
-    float g = 230.f / (255.f * std::max(out.exposure, 1e-3f));
+    float g = 230.f / (255.f * std::max(m.exposure, 1e-3f));
     float gmin = (in.format == IRIS_PIX_GRAY8) ? 1.f : 0.5f;
     g = std::min(16.f, std::max(gmin, g));
-    out.gain = g;
-    out.sat_level = 0.98f * 255.f * g;
-    out.off_x = x0;
-    out.off_y = y0;
-    out.img = ImageU8(w, h);
-    // Pass 2: lookup table from input code to 8-bit output.
+    m.gain = g;
+    m.sat_level = 0.98f * 255.f * g;
+    m.identity = in.format == IRIS_PIX_GRAY8 && g == 1.f;
+    // Lookup table from input code to 8-bit output.
     const float k = 255.f * g / full;
-    std::vector<uint8_t> lut(size_t(maxv) + 1);
+    m.lut.resize(size_t(maxv) + 1);
     for (int v = 0; v <= maxv; ++v) {
         float o = float(v) * k + 0.5f;
-        lut[size_t(v)] = uint8_t(o >= 255.f ? 255 : o);
+        m.lut[size_t(v)] = uint8_t(o >= 255.f ? 255 : o);
     }
-    for (int y = 0; y < h; ++y) {
-        uint8_t *dst = out.img.row(y);
-        const uint8_t *row = base + size_t(y + y0) * stride;
-        if (in.format == IRIS_PIX_GRAY8) {
-            if (g == 1.f) std::memcpy(dst, row + x0, size_t(w));
-            else
-                for (int x = 0; x < w; ++x) dst[x] = lut[row[x + x0]];
-        } else if (in.format == IRIS_PIX_GRAY16) {
-            for (int x = 0; x < w; ++x) {
-                uint16_t v;
-                std::memcpy(&v, row + size_t(x + x0) * 2, 2);
-                dst[x] = lut[size_t(std::min<int>(v, maxv))];
+    return true;
+}
+
+// Converts row `y` (map coordinates), columns [x, x + n), into dst.
+static void convert_row(const InputMap &m, int x, int y, int n, uint8_t *dst) {
+    const uint8_t *row = m.base + size_t(y + m.y0) * m.stride;
+    const int xs = x + m.x0;
+    const uint8_t *lut = m.lut.data();
+    if (m.format == IRIS_PIX_GRAY8) {
+        if (m.identity) std::memcpy(dst, row + xs, size_t(n));
+        else
+            for (int i = 0; i < n; ++i) dst[i] = lut[row[xs + i]];
+    } else if (m.format == IRIS_PIX_GRAY16) {
+        for (int i = 0; i < n; ++i) {
+            uint16_t v;
+            std::memcpy(&v, row + size_t(xs + i) * 2, 2);
+            dst[i] = lut[size_t(std::min<int>(v, m.maxv))];
+        }
+    } else {
+        for (int i = 0; i < n; ++i) dst[i] = lut[size_t(raw10_at(row, xs + i))];
+    }
+}
+
+void convert_rect(const InputMap &m, int x, int y, int w, int h, ImageU8 &out) {
+    if (out.w != w || out.h != h || out.px.size() != size_t(w) * h) {
+        out.w = w, out.h = h;
+        out.px.resize(size_t(w) * h);
+    }
+    for (int r = 0; r < h; ++r) convert_row(m, x, y + r, w, out.row(r));
+}
+
+void convert_rect_float(const InputMap &m, int x, int y, int w, int h, ImageF &out,
+                        std::vector<uint8_t> &tmp) {
+    if (out.w != w || out.h != h || out.px.size() != size_t(w) * h) {
+        out.w = w, out.h = h;
+        out.px.resize(size_t(w) * h);
+    }
+    tmp.resize(size_t(w));
+    for (int r = 0; r < h; ++r) {
+        convert_row(m, x, y + r, w, tmp.data());
+        float *d = out.row(r);
+        for (int i = 0; i < w; ++i) d[i] = float(tmp[size_t(i)]);
+    }
+}
+
+void convert_coarse(const InputMap &m, int f, int x, int y, int w, int h, ImageU8 &out,
+                    std::vector<uint8_t> &rowbuf, std::vector<uint32_t> &acc) {
+    // Box mean of the raw codes, then the gain: one table lookup per coarse pixel instead of one
+    // per input pixel. Only the candidate search reads this image (the fits use convert_rect).
+    // With unit gain on 8-bit input it equals the box mean of the converted image.
+    const int cw = w / f, ch = h / f;
+    if (out.w != cw || out.h != ch || out.px.size() != size_t(cw) * ch) {
+        out.w = cw, out.h = ch;
+        out.px.resize(size_t(cw) * ch);
+    }
+    (void)rowbuf;
+    acc.resize(size_t(cw));
+    const uint32_t area = uint32_t(f * f);
+    const float k = m.gain * 255.f / float(m.maxv) / float(area);
+    for (int cy = 0; cy < ch; ++cy) {
+        std::fill(acc.begin(), acc.end(), 0u);
+        for (int dy = 0; dy < f; ++dy) {
+            const uint8_t *row = m.base + size_t(y + cy * f + dy + m.y0) * m.stride;
+            const int xs = x + m.x0;
+            uint32_t *a = acc.data();
+            if (m.format == IRIS_PIX_GRAY8) {
+                const uint8_t *s = row + xs;
+                if (f == 2) {
+                    for (int i = 0; i < cw; ++i) a[i] += uint32_t(s[2 * i]) + s[2 * i + 1];
+                } else {
+                    for (int i = 0; i < cw; ++i)
+                        for (int dx = 0; dx < f; ++dx) a[i] += s[i * f + dx];
+                }
+            } else if (m.format == IRIS_PIX_GRAY16) {
+                for (int i = 0; i < cw; ++i)
+                    for (int dx = 0; dx < f; ++dx) {
+                        uint16_t v;
+                        std::memcpy(&v, row + size_t(xs + i * f + dx) * 2, 2);
+                        a[i] += uint32_t(std::min<int>(v, m.maxv));
+                    }
+            } else {
+                for (int i = 0; i < cw; ++i)
+                    for (int dx = 0; dx < f; ++dx) a[i] += uint32_t(raw10_at(row, xs + i * f + dx));
             }
+        }
+        uint8_t *d = out.row(cy);
+        if (m.identity) {
+            for (int i = 0; i < cw; ++i) d[i] = uint8_t((acc[size_t(i)] + area / 2) / area);
         } else {
-            for (int x = 0; x < w; ++x) dst[x] = lut[size_t(raw10_at(row, x + x0))];
+            for (int i = 0; i < cw; ++i) {
+                const float o = float(acc[size_t(i)]) * k + 0.5f;
+                d[i] = uint8_t(o >= 255.f ? 255 : o);
+            }
         }
     }
+}
+
+bool convert_input(const iris_image &in, Gray8 &out) {
+    InputMap m;
+    if (!prepare_input(in, m)) return false;
+    out.exposure = m.exposure;
+    out.gain = m.gain;
+    out.sat_level = m.sat_level;
+    out.off_x = m.x0;
+    out.off_y = m.y0;
+    convert_rect(m, 0, 0, m.w, m.h, out.img);
     return true;
 }
 
@@ -157,30 +251,57 @@ ImageF to_float(const ImageU8 &src, int x0, int y0, int w, int h) {
 }
 
 void gaussian_blur(const ImageF &src, ImageF &dst, float sigma) {
+    ImageF tmp;
+    std::vector<float> k, col;
+    gaussian_blur(src, dst, sigma, tmp, k, col);
+}
+
+static void resize_like(ImageF &img, int w, int h) {
+    if (img.w != w || img.h != h || img.px.size() != size_t(w) * h) {
+        img.w = w, img.h = h;
+        img.px.resize(size_t(w) * h);
+    }
+}
+
+// Separable Gaussian with clamped borders. The taps are always summed in the same order
+// (i = -r..r) as the plain per-pixel loop, so the result is bit-identical to it; only the
+// interior skips the clamping and runs tap-outer so that it vectorizes.
+void gaussian_blur(const ImageF &src, ImageF &dst, float sigma, ImageF &tmp, std::vector<float> &k,
+                   std::vector<float> &col) {
     if (sigma <= 0.f) {
         dst = src;
         return;
     }
     int r = std::max(1, int(std::ceil(3.f * sigma)));
-    std::vector<float> k(static_cast<size_t>(2 * r + 1));
+    k.resize(static_cast<size_t>(2 * r + 1));
     float s = 0;
     for (int i = -r; i <= r; ++i) s += (k[size_t(i + r)] = std::exp(-0.5f * float(i * i) / (sigma * sigma)));
     for (auto &v : k) v /= s;
-    ImageF tmp(src.w, src.h);
+    resize_like(tmp, src.w, src.h);
+    const int w = src.w;
+    const int lo = std::min(r, w), hi = std::max(lo, w - r);  // interior: [lo, hi)
     for (int y = 0; y < src.h; ++y) {
         const float *in = src.row(y);
         float *o = tmp.row(y);
-        for (int x = 0; x < src.w; ++x) {
+        auto clamped = [&](int x) {
             float acc = 0;
             for (int i = -r; i <= r; ++i) {
-                int xx = std::min(src.w - 1, std::max(0, x + i));
+                int xx = std::min(w - 1, std::max(0, x + i));
                 acc += k[size_t(i + r)] * in[xx];
             }
             o[x] = acc;
+        };
+        for (int x = 0; x < lo; ++x) clamped(x);
+        for (int x = lo; x < hi; ++x) o[x] = 0.f;
+        for (int i = -r; i <= r; ++i) {
+            const float kv = k[size_t(i + r)];
+            const float *iin = in + i;
+            for (int x = lo; x < hi; ++x) o[x] += kv * iin[x];
         }
+        for (int x = hi; x < w; ++x) clamped(x);
     }
-    dst = ImageF(src.w, src.h);
-    std::vector<float> col(static_cast<size_t>(src.w));
+    resize_like(dst, src.w, src.h);
+    col.resize(static_cast<size_t>(src.w));
     for (int y = 0; y < src.h; ++y) {
         std::fill(col.begin(), col.end(), 0.f);
         for (int i = -r; i <= r; ++i) {
@@ -191,24 +312,6 @@ void gaussian_blur(const ImageF &src, ImageF &dst, float sigma) {
         }
         std::copy(col.begin(), col.end(), dst.row(y));
     }
-}
-
-float bilinear(const ImageF &img, float x, float y, bool *ok) {
-    if (!(x >= 0.f && y >= 0.f && x <= float(img.w - 1) && y <= float(img.h - 1))) {
-        if (ok) *ok = false;
-        return 0.f;
-    }
-    int x0 = std::min(int(x), img.w - 2), y0 = std::min(int(y), img.h - 2);
-    if (img.w < 2 || img.h < 2) {
-        if (ok) *ok = false;
-        return 0.f;
-    }
-    float fx = x - float(x0), fy = y - float(y0);
-    const float *r0 = img.row(y0), *r1 = img.row(y0 + 1);
-    float a = r0[x0] + fx * (r0[x0 + 1] - r0[x0]);
-    float b = r1[x0] + fx * (r1[x0 + 1] - r1[x0]);
-    if (ok) *ok = true;
-    return a + fy * (b - a);
 }
 
 float Contour::radius(float t) const {

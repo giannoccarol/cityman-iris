@@ -1,6 +1,8 @@
 // Internal C++ interfaces of the cityman-iris engine. Not installed, not ABI-stable.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <vector>
@@ -10,6 +12,13 @@
 namespace citymaniris {
 
 // ---------------------------------------------------------------- images
+
+// std::lround for |v| < 2^23 (half away from zero), inline: v - trunc(v) is exact in float.
+inline int iround(float v) {
+    const float t = float(int(v));
+    const float d = v - t;
+    return int(t) + (d >= 0.5f ? 1 : d <= -0.5f ? -1 : 0);
+}
 
 template <typename T>
 struct Image {
@@ -35,11 +44,48 @@ struct Gray8 {
     float sat_level = 255.f;    // 8-bit level corresponding to input saturation
 };
 
+// Input after the automatic gain, converted lazily: only the coarse search image and the crops
+// around the candidates are ever converted (the full-resolution frame never is).
+struct InputMap {
+    const uint8_t *base = nullptr;
+    size_t stride = 0;
+    int format = 0, maxv = 0;
+    int x0 = 0, y0 = 0, w = 0, h = 0;  // ROI of the input; map coordinates are relative to it
+    float exposure = 0.f, gain = 1.f, sat_level = 255.f;
+    bool identity = false;             // 8-bit input with unit gain: plain copy
+    std::vector<uint8_t> lut;
+    std::vector<uint16_t> bin_of;
+    std::vector<uint32_t> h4;
+};
+
+bool prepare_input(const iris_image &in, InputMap &m);
+void convert_rect(const InputMap &m, int x, int y, int w, int h, ImageU8 &out);
+void convert_rect_float(const InputMap &m, int x, int y, int w, int h, ImageF &out, std::vector<uint8_t> &tmp);
+void convert_coarse(const InputMap &m, int f, int x, int y, int w, int h, ImageU8 &out,
+                    std::vector<uint8_t> &rowbuf, std::vector<uint32_t> &acc);
 bool convert_input(const iris_image &in, Gray8 &out);
 ImageU8 downsample_box(const ImageU8 &src, int f);
 ImageF to_float(const ImageU8 &src, int x0, int y0, int w, int h);
 void gaussian_blur(const ImageF &src, ImageF &dst, float sigma);
-float bilinear(const ImageF &img, float x, float y, bool *ok);
+void gaussian_blur(const ImageF &src, ImageF &dst, float sigma, ImageF &tmp, std::vector<float> &k,
+                   std::vector<float> &col);
+inline float bilinear(const ImageF &img, float x, float y, bool *ok) {
+    if (!(x >= 0.f && y >= 0.f && x <= float(img.w - 1) && y <= float(img.h - 1))) {
+        if (ok) *ok = false;
+        return 0.f;
+    }
+    int x0 = std::min(int(x), img.w - 2), y0 = std::min(int(y), img.h - 2);
+    if (img.w < 2 || img.h < 2) {
+        if (ok) *ok = false;
+        return 0.f;
+    }
+    float fx = x - float(x0), fy = y - float(y0);
+    const float *r0 = img.row(y0), *r1 = img.row(y0 + 1);
+    float a = r0[x0] + fx * (r0[x0 + 1] - r0[x0]);
+    float b = r1[x0] + fx * (r1[x0 + 1] - r1[x0]);
+    if (ok) *ok = true;
+    return a + fy * (b - a);
+}
 
 // ---------------------------------------------------------------- geometry
 
@@ -53,6 +99,12 @@ struct Contour {
     float radius(float t) const;
     float mean_radius() const { return a0; }
     float max_radius() const;
+    // Upper bound of radius(t) for every t (a0 + sum of |harmonics|).
+    float radius_bound() const {
+        float r = a0;
+        for (int k = 0; k < order; ++k) r += std::fabs(a[k]) + std::fabs(b[k]);
+        return r;
+    }
 };
 
 struct Parabola {
@@ -81,6 +133,63 @@ struct ExtractDebug {
     ImageU8 norm_valid;
     std::vector<float> cand_x, cand_y, cand_r, cand_score;  // input coordinates
     float exposure = 0;
+};
+
+// ---------------------------------------------------------------- reusable buffers
+
+struct Run {
+    int y, x0, x1;  // x1 exclusive
+    int parent;
+};
+struct Comp {
+    long area;
+    int bx0, bx1, by0, by1;
+    int first_run;
+};
+
+struct CropCtx {
+    ImageF raw, s1, s2;  // raw, sigma 1, sigma 2
+    ImageU8 glint;       // 1 = specular reflection (dilated)
+    float glint_level = 255.f;
+    bool in_glint(float x, float y) const {
+        int xi = iround(x), yi = iround(y);
+        return glint.inside(xi, yi) && glint.at(xi, yi);
+    }
+};
+
+// Everything extract() would otherwise allocate per call. One per thread (iris_context).
+struct Scratch {
+    InputMap map;
+    ImageU8 coarse;
+    std::vector<uint8_t> rowbuf, convtmp;
+    std::vector<uint32_t> rowacc;
+    // pupil candidates
+    std::vector<uint8_t> closed, ctmp, row_min, box;
+    std::vector<Run> runs;
+    std::vector<size_t> row_start;
+    std::vector<Comp> comps;
+    std::vector<int> comp_of, next_run;
+    std::vector<int32_t> stack;
+    // crops (current candidate and best so far, swapped)
+    CropCtx cur, best;
+    ImageU8 raw_g, mask, best_mask, ring;
+    ImageF blur_tmp;
+    std::vector<float> kernel, col, vals;
+    // rubber sheet and encoder
+    ImageF norm;
+    ImageU8 valid;
+    struct Encode {
+        ImageF sm;
+        std::vector<float> kw, rowmean, are, aim, re_all, im_all;
+        std::vector<std::complex<float>> spec, resp;
+        std::vector<uint8_t> okv;
+        std::vector<int> prefix;
+    } enc;
+};
+
+// Expected iris position (input coordinates) to restrict the eye search; r <= 0: none.
+struct Hint {
+    float x = 0, y = 0, r = 0;
 };
 
 // ---------------------------------------------------------------- codes
@@ -118,6 +227,10 @@ struct iris_template {
     std::vector<citymaniris::Code> codes;
 };
 
+struct iris_context {
+    citymaniris::Scratch scratch;
+};
+
 struct iris_engine {
     iris_config cfg;
     citymaniris::Layout layout;
@@ -129,11 +242,15 @@ namespace citymaniris {
 
 iris_status extract(const iris_engine &eng, const iris_image &img, iris_template **out,
                     iris_quality *q, ExtractDebug *dbg);
-bool segment(const iris_engine &eng, const Gray8 &g, Segmentation &seg, int &crop_x, int &crop_y,
-             ImageF &crop, ImageU8 &noise_mask, iris_status &st, ExtractDebug *dbg);
+iris_status extract(const iris_engine &eng, Scratch &sc, const iris_image &img, const Hint *hint,
+                    iris_template **out, iris_quality *q, ExtractDebug *dbg);
+// On success the crop is sc.best.raw and the noise mask sc.best_mask (crop coordinates).
+bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation &seg, int &crop_x,
+             int &crop_y, iris_status &st, ExtractDebug *dbg);
 void normalize_iris(const iris_engine &eng, const Segmentation &seg, const ImageF &crop,
                     const ImageU8 &noise_mask, ImageF &norm, ImageU8 &valid);
 void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Code &code);
+void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Code &code, Scratch::Encode &b);
 
 struct PairScore {
     float score = 1.f, raw = 1.f;

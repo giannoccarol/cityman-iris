@@ -30,7 +30,8 @@ extern "C" {
 #endif
 
 /* Bumped on any incompatible change of this header. */
-#define IRIS_ENGINE_API_VERSION 1
+/* 2: iris_context and iris_extract_ex (search hint, reusable buffers). */
+#define IRIS_ENGINE_API_VERSION 2
 /* Version written in serialized templates (see iris_template_serialize). */
 #define IRIS_TEMPLATE_FORMAT_VERSION 1
 
@@ -163,6 +164,15 @@ typedef struct iris_enroll_info {
 
 typedef struct iris_engine iris_engine;
 typedef struct iris_template iris_template;
+/* Per-thread working memory of iris_extract_ex (since API 2). Not thread safe: one per thread. */
+typedef struct iris_context iris_context;
+
+/* Expected position of the iris (input image coordinates), e.g. iris_x/iris_y/iris_r of the
+ * previous frame. Since API 2. */
+typedef struct iris_search_hint {
+    float x, y;  /* iris centre */
+    float r;     /* iris radius; <= 0 disables the hint */
+} iris_search_hint;
 
 IRIS_API int iris_engine_api_version(void);
 IRIS_API const char *iris_status_string(iris_status status);
@@ -183,6 +193,20 @@ IRIS_API iris_status iris_extract_image(const iris_engine *engine, const iris_im
 IRIS_API iris_status iris_extract(const iris_engine *engine, const uint8_t *gray, int32_t width,
                                   int32_t height, int32_t stride, iris_template **template_out,
                                   iris_quality *quality);
+
+/*
+ * Since API 2. Same result as iris_extract_image(), faster on video:
+ * - `context` (optional) keeps the working buffers between calls, so steady-state calls do not
+ *   allocate; create one per thread with iris_context_create().
+ * - `hint` (optional) restricts the eye search to a window around the given iris position first
+ *   (about 2.2 radii around it); when no eye is found there, the whole image is searched as
+ *   usual. The segmentation, template and quality are those of the eye found.
+ */
+IRIS_API iris_status iris_context_create(const iris_engine *engine, iris_context **context_out);
+IRIS_API void iris_context_destroy(iris_context *context);
+IRIS_API iris_status iris_extract_ex(const iris_engine *engine, iris_context *context,
+                                     const iris_image *image, const iris_search_hint *hint,
+                                     iris_template **template_out, iris_quality *quality);
 
 /* Compare two templates (minimum over all code pairs and rotations). */
 IRIS_API iris_status iris_match(const iris_engine *engine, const iris_template *probe,

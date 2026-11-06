@@ -98,28 +98,34 @@ namespace citymaniris {
 
 iris_status extract(const iris_engine &eng, const iris_image &img, iris_template **out, iris_quality *q,
                     ExtractDebug *dbg) {
+    Scratch sc;
+    return extract(eng, sc, img, nullptr, out, q, dbg);
+}
+
+iris_status extract(const iris_engine &eng, Scratch &sc, const iris_image &img, const Hint *hint,
+                    iris_template **out, iris_quality *q, ExtractDebug *dbg) {
     *out = nullptr;
     const iris_config &cfg = eng.cfg;
-    Gray8 g;
-    if (!convert_input(img, g)) return IRIS_E_INVALID_ARGUMENT;
-    if (q) q->exposure = g.exposure;
-    if (dbg) dbg->exposure = g.exposure, dbg->roi_x = g.off_x, dbg->roi_y = g.off_y;
-    if (g.img.w < int(2.f * cfg.min_iris_radius) + 4 || g.img.h < int(2.f * cfg.min_iris_radius) + 4)
+    InputMap &m = sc.map;
+    if (!prepare_input(img, m)) return IRIS_E_INVALID_ARGUMENT;
+    if (q) q->exposure = m.exposure;
+    if (dbg) dbg->exposure = m.exposure, dbg->roi_x = m.x0, dbg->roi_y = m.y0;
+    if (m.w < int(2.f * cfg.min_iris_radius) + 4 || m.h < int(2.f * cfg.min_iris_radius) + 4)
         return IRIS_Q_IMAGE_TOO_SMALL;
-    if (g.exposure < 0.04f) return IRIS_Q_UNDEREXPOSED;
+    if (m.exposure < 0.04f) return IRIS_Q_UNDEREXPOSED;
 
     Segmentation seg;
     int cx = 0, cy = 0;
-    ImageF crop;
-    ImageU8 nmask;
     iris_status st = IRIS_OK;
-    bool found = segment(eng, g, seg, cx, cy, crop, nmask, st, dbg);
+    bool found = segment(eng, sc, hint, seg, cx, cy, st, dbg);
     if (dbg) {
         dbg->seg = seg;
         dbg->crop_x = cx, dbg->crop_y = cy;
     }
     if (!found) return st;
-    if (q) fill_quality_geometry(q, seg, cx + g.off_x, cy + g.off_y);
+    const ImageF &crop = sc.best.raw;
+    const ImageU8 &nmask = sc.best_mask;
+    if (q) fill_quality_geometry(q, seg, cx + m.x0, cy + m.y0);
     if (st != IRIS_OK) return st;
     if (seg.iris.a0 < cfg.min_iris_radius) return IRIS_Q_IRIS_TOO_SMALL;
 
@@ -130,7 +136,7 @@ iris_status extract(const iris_engine &eng, const iris_image &img, iris_template
             float t = float(i) * 6.2831853f / 64.f;
             float x = seg.iris.cx + seg.iris.a0 * std::cos(t), y = seg.iris.cy + seg.iris.a0 * std::sin(t);
             int gx = int(x) + cx, gy = int(y) + cy;
-            if (gx < 0 || gy < 0 || gx >= g.img.w || gy >= g.img.h) outside++;
+            if (gx < 0 || gy < 0 || gx >= m.w || gy >= m.h) outside++;
         }
         if (outside > 16) return IRIS_Q_OUT_OF_FRAME;
     }
@@ -146,8 +152,8 @@ iris_status extract(const iris_engine &eng, const iris_image &img, iris_template
     if (q) q->focus = focus;
     if (ratio > cfg.max_blur_ratio) return IRIS_Q_BLURRED;
 
-    ImageF norm;
-    ImageU8 valid;
+    ImageF &norm = sc.norm;
+    ImageU8 &valid = sc.valid;
     normalize_iris(eng, seg, crop, nmask, norm, valid);
     // eyelid coverage on the rubber sheet (geometry only)
     {
@@ -167,7 +173,7 @@ iris_status extract(const iris_engine &eng, const iris_image &img, iris_template
         if (q) q->eyelid_coverage = float(lid) / float((R / 2) * (C / 2));
     }
     Code code;
-    encode(eng, norm, valid, code);
+    encode(eng, norm, valid, code, sc.enc);
     if (dbg) dbg->norm = norm, dbg->norm_valid = valid;
     const float usable = float(code.valid_bits) / float(eng.layout.bits_total());
     // The fragile-bit mask removes a fixed share of the bits; compare what is left with the
@@ -302,6 +308,47 @@ iris_status iris_extract_image(const iris_engine *e, const iris_image *img, iris
     }
     iris_status st = IRIS_E_INTERNAL;
     IRIS_TRY { st = citymaniris::extract(*e, *img, out, q, nullptr); }
+    IRIS_CATCH_ALL
+    if (q) {
+        q->status = st;
+        if (st != IRIS_OK) q->overall = 0.f;
+    }
+    return st;
+}
+
+iris_status iris_context_create(const iris_engine *e, iris_context **out) {
+    if (!out) return IRIS_E_INVALID_ARGUMENT;
+    *out = nullptr;
+    if (!e) return IRIS_E_INVALID_ARGUMENT;
+    IRIS_TRY { *out = new iris_context; }
+    IRIS_CATCH_ALL
+    return IRIS_OK;
+}
+
+void iris_context_destroy(iris_context *c) { delete c; }
+
+iris_status iris_extract_ex(const iris_engine *e, iris_context *ctx, const iris_image *img,
+                            const iris_search_hint *hint, iris_template **out, iris_quality *q) {
+    if (out) *out = nullptr;
+    if (!e || !img || !out) return IRIS_E_INVALID_ARGUMENT;
+    if (q) {
+        if (q->struct_size != sizeof(iris_quality)) return IRIS_E_INVALID_ARGUMENT;
+        std::memset(q, 0, sizeof(*q));
+        q->struct_size = sizeof(iris_quality);
+    }
+    Hint h;
+    if (hint && hint->r > 0.f && std::isfinite(hint->x) && std::isfinite(hint->y) && std::isfinite(hint->r)) {
+        h.x = hint->x, h.y = hint->y, h.r = hint->r;
+    }
+    iris_status st = IRIS_E_INTERNAL;
+    IRIS_TRY {
+        if (ctx) {
+            st = citymaniris::extract(*e, ctx->scratch, *img, h.r > 0.f ? &h : nullptr, out, q, nullptr);
+        } else {
+            Scratch sc;
+            st = citymaniris::extract(*e, sc, *img, h.r > 0.f ? &h : nullptr, out, q, nullptr);
+        }
+    }
     IRIS_CATCH_ALL
     if (q) {
         q->status = st;
