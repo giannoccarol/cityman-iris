@@ -50,28 +50,35 @@ bool convert_input(const iris_image &in, Gray8 &out) {
     const float full = float((1u << bits) - 1u);
     const uint8_t *base = static_cast<const uint8_t *>(in.data);
 
-    // Pass 1: histogram of the normalized value (1024 bins) on a sparse grid.
-    std::vector<uint32_t> hist(1024, 0);
+    // Pass 1: histogram (1024 bins of the normalized value) on a sparse grid. Four interleaved
+    // histograms keep uniform regions from serializing on a single counter.
+    std::vector<uint32_t> h4(4 * 1024, 0);
     uint64_t count = 0;
-    auto value = [&](int x, int y) -> int {
-        const uint8_t *row = base + size_t(y) * stride;
+    const int maxv = int(full);
+    // bin index for every possible input code (up to 16 bits)
+    std::vector<uint16_t> bin_of(size_t(maxv) + 1);
+    for (int v = 0; v <= maxv; ++v) bin_of[size_t(v)] = uint16_t(std::min(1023, int(float(v) / full * 1023.f + 0.5f)));
+    auto value = [&](const uint8_t *row, int x) -> int {
         switch (in.format) {
             case IRIS_PIX_GRAY8: return row[x];
             case IRIS_PIX_GRAY16: {
                 uint16_t v;
                 std::memcpy(&v, row + size_t(x) * 2, 2);
-                return std::min<int>(v, int(full));
+                return std::min<int>(v, maxv);
             }
             default: return raw10_at(row, x);
         }
     };
     const int step = (size_t(w) * size_t(h) > 400000u) ? 2 : 1;
-    for (int y = y0; y < y0 + h; y += step)
-        for (int x = x0; x < x0 + w; x += step) {
-            int b = int(float(value(x, y)) / full * 1023.f + 0.5f);
-            hist[size_t(std::min(1023, std::max(0, b)))]++;
-            count++;
-        }
+    for (int y = y0; y < y0 + h; y += step) {
+        const uint8_t *row = base + size_t(y) * stride;
+        int k = 0;
+        for (int x = x0; x < x0 + w; x += step, ++k) h4[size_t(k & 3) * 1024 + bin_of[size_t(value(row, x))]]++;
+        count += uint64_t(k);
+    }
+    std::vector<uint32_t> hist(1024, 0);
+    for (int b = 0; b < 1024; ++b)
+        hist[size_t(b)] = h4[size_t(b)] + h4[1024 + size_t(b)] + h4[2048 + size_t(b)] + h4[3072 + size_t(b)];
     uint64_t target = uint64_t(double(count) * 0.995), acc = 0;
     int p995 = 1023;
     for (int b = 0; b < 1024; ++b) {
@@ -91,16 +98,28 @@ bool convert_input(const iris_image &in, Gray8 &out) {
     out.off_x = x0;
     out.off_y = y0;
     out.img = ImageU8(w, h);
+    // Pass 2: lookup table from input code to 8-bit output.
     const float k = 255.f * g / full;
+    std::vector<uint8_t> lut(size_t(maxv) + 1);
+    for (int v = 0; v <= maxv; ++v) {
+        float o = float(v) * k + 0.5f;
+        lut[size_t(v)] = uint8_t(o >= 255.f ? 255 : o);
+    }
     for (int y = 0; y < h; ++y) {
         uint8_t *dst = out.img.row(y);
-        if (in.format == IRIS_PIX_GRAY8 && g == 1.f) {
-            std::memcpy(dst, base + size_t(y + y0) * stride + x0, size_t(w));
-            continue;
-        }
-        for (int x = 0; x < w; ++x) {
-            float v = float(value(x + x0, y + y0)) * k + 0.5f;
-            dst[x] = uint8_t(v >= 255.f ? 255 : v);
+        const uint8_t *row = base + size_t(y + y0) * stride;
+        if (in.format == IRIS_PIX_GRAY8) {
+            if (g == 1.f) std::memcpy(dst, row + x0, size_t(w));
+            else
+                for (int x = 0; x < w; ++x) dst[x] = lut[row[x + x0]];
+        } else if (in.format == IRIS_PIX_GRAY16) {
+            for (int x = 0; x < w; ++x) {
+                uint16_t v;
+                std::memcpy(&v, row + size_t(x + x0) * 2, 2);
+                dst[x] = lut[size_t(std::min<int>(v, maxv))];
+            }
+        } else {
+            for (int x = 0; x < w; ++x) dst[x] = lut[size_t(raw10_at(row, x + x0))];
         }
     }
     return true;

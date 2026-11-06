@@ -151,40 +151,42 @@ bool fit_fourier(const std::vector<float> &xs, const std::vector<float> &ys, std
 
 // ---------------------------------------------------------------- pupil candidates
 
-// 3x3 opening (erosion then dilation), separable, branch-free inner loops (vectorizable);
-// outside the image counts as background.
-template <bool kErode>
+// Grey-level 3x3 closing (max filter then min filter), separable, branch-free inner loops.
+// Outside the image is treated as bright, so dark sets touching the border are eroded like the
+// binary opening with a background border.
+template <bool kMax>
 void hpass3(const uint8_t *src, uint8_t *dst, int w, int h) {
     for (int y = 0; y < h; ++y) {
         const uint8_t *s = src + size_t(y) * w;
         uint8_t *d = dst + size_t(y) * w;
-        if (w == 1) {
-            d[0] = kErode ? 0 : s[0];
+        if (w < 2) {
+            d[0] = kMax ? 255 : s[0];
             continue;
         }
-        d[0] = kErode ? 0 : uint8_t(s[0] | s[1]);
+        d[0] = kMax ? 255 : std::min(s[0], s[1]);
         for (int x = 1; x + 1 < w; ++x)
-            d[x] = kErode ? uint8_t(s[x - 1] & s[x] & s[x + 1]) : uint8_t(s[x - 1] | s[x] | s[x + 1]);
-        d[w - 1] = kErode ? 0 : uint8_t(s[w - 2] | s[w - 1]);
+            d[x] = kMax ? std::max(std::max(s[x - 1], s[x]), s[x + 1]) : std::min(std::min(s[x - 1], s[x]), s[x + 1]);
+        d[w - 1] = kMax ? 255 : std::min(s[w - 2], s[w - 1]);
     }
 }
 
-template <bool kErode>
+template <bool kMax>
 void vpass3(const uint8_t *src, uint8_t *dst, int w, int h) {
     for (int y = 0; y < h; ++y) {
         uint8_t *d = dst + size_t(y) * w;
         const uint8_t *c = src + size_t(y) * w;
         if (y == 0 || y == h - 1) {
             const uint8_t *o = y == 0 ? (h > 1 ? c + w : nullptr) : c - w;
-            for (int x = 0; x < w; ++x) d[x] = kErode ? 0 : uint8_t(c[x] | (o ? o[x] : 0));
+            for (int x = 0; x < w; ++x) d[x] = kMax ? 255 : std::min(c[x], o ? o[x] : c[x]);
             continue;
         }
         const uint8_t *u = c - w, *o = c + w;
-        for (int x = 0; x < w; ++x) d[x] = kErode ? uint8_t(u[x] & c[x] & o[x]) : uint8_t(u[x] | c[x] | o[x]);
+        for (int x = 0; x < w; ++x)
+            d[x] = kMax ? std::max(std::max(u[x], c[x]), o[x]) : std::min(std::min(u[x], c[x]), o[x]);
     }
 }
 
-void binary_open3(std::vector<uint8_t> &b, std::vector<uint8_t> &t, int w, int h) {
+void grey_close3(std::vector<uint8_t> &b, std::vector<uint8_t> &t, int w, int h) {
     hpass3<true>(b.data(), t.data(), w, h);
     vpass3<true>(t.data(), b.data(), w, h);
     hpass3<false>(b.data(), t.data(), w, h);
@@ -205,8 +207,19 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
     const int w = c.w, h = c.h;
     std::vector<Cand> out;
     if (w < 8 || h < 8) return out;
-    uint32_t hist[256] = {0};
-    for (uint8_t v : c.px) hist[v]++;
+    // Four interleaved histograms: uniform regions would otherwise serialize on one counter.
+    uint32_t h4[4][256] = {{0}};
+    const size_t np = c.px.size();
+    size_t hi = 0;
+    for (; hi + 4 <= np; hi += 4) {
+        h4[0][c.px[hi]]++;
+        h4[1][c.px[hi + 1]]++;
+        h4[2][c.px[hi + 2]]++;
+        h4[3][c.px[hi + 3]]++;
+    }
+    for (; hi < np; ++hi) h4[0][c.px[hi]]++;
+    uint32_t hist[256];
+    for (int k = 0; k < 256; ++k) hist[k] = h4[0][k] + h4[1][k] + h4[2][k] + h4[3][k];
     auto pct = [&](double q) {
         uint64_t tgt = uint64_t(q * double(c.px.size())), acc = 0;
         for (int i = 0; i < 256; ++i) {
@@ -229,7 +242,7 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
 
     const float rmin = rmin_full / float(f), rmax = rmax_full / float(f);
     const float amin = kPi * rmin * rmin * 0.5f, amax = kPi * rmax * rmax * 1.2f;
-    std::vector<uint8_t> bin(static_cast<size_t>(w) * h), tmp(static_cast<size_t>(w) * h);
+    std::vector<uint8_t> tmp(static_cast<size_t>(w) * h);
     std::vector<Run> runs;
     std::vector<size_t> row_start;
     std::vector<Comp> comps;
@@ -237,32 +250,33 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
     std::vector<int32_t> stack;
     std::vector<uint8_t> box;
 
+    // Threshold decomposition: the binary 3x3 opening of {c < T} equals {closing(c) < T} with the
+    // grey-level closing (max then min filter), so one closing serves every threshold.
+    std::vector<uint8_t> closed(c.px);
+    if (rmin >= 2.f) grey_close3(closed, tmp, w, h);
+    std::vector<uint8_t> row_min(static_cast<size_t>(h), 255);
+    for (int y = 0; y < h; ++y) {
+        const uint8_t *r = closed.data() + size_t(y) * w;
+        uint8_t m = 255;
+        for (int x = 0; x < w; ++x) m = std::min(m, r[x]);
+        row_min[size_t(y)] = m;
+    }
     for (int T : th) {
-        {
-            const uint8_t *src = c.px.data();
-            const uint8_t tt = uint8_t(T);
-            for (size_t i = 0; i < bin.size(); ++i) bin[i] = uint8_t(src[i] < tt);
-        }
-        if (rmin >= 2.f) binary_open3(bin, tmp, w, h);
+        const uint8_t tt = uint8_t(T);
         // Run-length connected components (8-connectivity), union-find on runs: the cost follows
         // the number of runs, not the area, so large dark backgrounds stay cheap.
         runs.clear();
         row_start.assign(size_t(h) + 1, 0);
         for (int y = 0; y < h; ++y) {
             row_start[size_t(y)] = runs.size();
-            const uint8_t *r = bin.data() + size_t(y) * w;
+            if (row_min[size_t(y)] >= tt) continue;
+            const uint8_t *r = closed.data() + size_t(y) * w;
             int x = 0;
             while (x < w) {
-                while (x + 8 <= w) {
-                    uint64_t wd;
-                    std::memcpy(&wd, r + x, 8);
-                    if (wd) break;
-                    x += 8;
-                }
-                while (x < w && !r[x]) ++x;
+                while (x < w && r[x] >= tt) ++x;
                 if (x >= w) break;
                 const int x_start = x;
-                while (x < w && r[x]) ++x;
+                while (x < w && r[x] < tt) ++x;
                 runs.push_back(Run{y, x_start, x, int(runs.size())});
             }
         }
