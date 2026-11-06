@@ -35,7 +35,7 @@ void simulate(int64_t exposure, int period, int64_t writeLatency, int64_t callba
     const int64_t t0 = 1000 * ms;
     std::vector<LedPulse> pulses;
     int64_t target = 0, prevTarget = 0;
-    int lit = 0, targets = 0, darkFrames = 0, partial = 0;
+    int lit = 0, targets = 0, darkFrames = 0, partial = 0, firstLit = -1;
     double onTotal = 0, maxDuty = 0;
     const int frames = 300;
     for (int n = 0; n < frames; n++) {
@@ -47,6 +47,7 @@ void simulate(int64_t exposure, int period, int64_t writeLatency, int64_t callba
         if (isTarget) {
             CHECK(fully);
             lit += fully;
+            if (firstLit < 0) firstLit = n;
             target = 0;
         } else {
             CHECK(!fully);
@@ -78,11 +79,16 @@ void simulate(int64_t exposure, int period, int64_t writeLatency, int64_t callba
             targets++;
         }
     }
+    // The first pulse goes on the first frame it can still cover once frame 0 has arrived
+    // (frame 0 is seen callbackLatency after its timestamp), not after a full cadence.
+    int expectFirst = 1;
+    while (t0 + expectFirst * fd - margin < t0 + callbackLatency + ms) expectFirst++;
+    CHECK(firstLit == expectFirst);
     const double seconds = frames * 33.44 / 1000;
-    std::printf("exp %2lld ms K=%d write %.2f ms cb %lld ms: %d/%d targets lit, %.1f lit/s, "
-                "dark %d, partial %d, duty max %.0f %%, avg on %.0f %%\n",
+    std::printf("exp %2lld ms K=%d write %.2f ms cb %lld ms: first lit frame %d (%.0f ms), %d/%d targets lit, "
+                "%.1f lit/s, dark %d, partial %d, duty max %.0f %%, avg on %.0f %%\n",
                 (long long)(exposure / ms), period, writeLatency / 1e6,
-                (long long)(callbackLatency / ms), lit, targets, lit / seconds, darkFrames, partial,
+                (long long)(callbackLatency / ms), firstLit, firstLit * 33.44, lit, targets, lit / seconds, darkFrames, partial,
                 maxDuty * 100, onTotal / (seconds * 1000) * 100);
     CHECK(lit == targets || lit == targets - 1);  // the last one may be still in flight
     CHECK(maxDuty <= kLedMaxDutyPermille / 1000.0 + 1e-9);

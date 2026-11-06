@@ -39,7 +39,8 @@ class IrisCapture {
   public:
     enum class Result { kProbes, kTimeout, kInterrupted, kCameraError, kLedUnavailable };
 
-    IrisCapture(IrLed* led, const iris_engine* engine);
+    // `engineContext` may be null (the engine then allocates per call).
+    IrisCapture(IrLed* led, const iris_engine* engine, iris_context* engineContext);
     ~IrisCapture();
 
     bool start(std::string* error);
@@ -55,13 +56,22 @@ class IrisCapture {
     int sensorOrientation() const { return mCamera.sensorOrientation(); }
 
   private:
-    void scheduleAfter(const Frame& f);
+    void scheduleAfter(const Frame& f) { scheduleFrom(f.timestampNs, f.skewNs); }
+    // Schedules the next pulse from the timestamp of a frame that has started (skew 0: unknown).
+    void scheduleFrom(int64_t timestampNs, int64_t skewNs);
     void process(const Frame& lit, std::vector<Probe>* probes);
     void adapt(const std::vector<Probe>& probes, float meanY);
     void dump(const Frame& f, const char* tag);
 
     IrLed* mLed;
     const iris_engine* mEngine;
+    iris_context* mEngineCtx;
+    // Where each eye was in the last lit frames: the engine searches there first.
+    struct EyeHint {
+        bool valid = false;
+        float x = 0, y = 0, r = 0;
+        int misses = 0;
+    } mHints[2];
     IrisCamera mCamera;
     std::atomic<bool> mInterrupted{false};
     bool mFirstFrame = false;

@@ -49,7 +49,8 @@ void rememberGoodSettings(int exposureUs, int iso, int ledMa) {
     gGoodLedMa = ledMa;
 }
 
-IrisCapture::IrisCapture(IrLed* led, const iris_engine* engine) : mLed(led), mEngine(engine) {}
+IrisCapture::IrisCapture(IrLed* led, const iris_engine* engine, iris_context* engineContext)
+    : mLed(led), mEngine(engine), mEngineCtx(engineContext) {}
 
 IrisCapture::~IrisCapture() {
     stop();
@@ -87,6 +88,7 @@ bool IrisCapture::start(std::string* error) {
     mDarkMean = -1.f;
     mDark = Frame{};
     mPulses = mLit = mRejectedDim = mMissed = mProcessed = 0;
+    mHints[0] = mHints[1] = EyeHint{};
 
     if (!mLed->usable()) {
         *error = "IR LED unavailable";
@@ -121,18 +123,18 @@ std::string IrisCapture::stats() const {
     return os.str();
 }
 
-void IrisCapture::scheduleAfter(const Frame& f) {
-    if (mTargetTs != 0 || mLed->pending()) return;
+void IrisCapture::scheduleFrom(int64_t timestampNs, int64_t skewNs) {
+    if (mTargetTs != 0 || mLed->pending() || timestampNs <= 0) return;
     const int64_t fd = mFrameDurationNs ? mFrameDurationNs : kDefaultFrameDurationNs;
     const int64_t exposure = std::max<int64_t>(mExposureSeenNs, int64_t(mExposureUs) * 1000);
-    const int64_t skew = f.skewNs > 0 ? f.skewNs : kDefaultSkewNs;
+    const int64_t skew = skewNs > 0 ? skewNs : kDefaultSkewNs;
     const int64_t len = skew + exposure + 2 * mMarginNs;
     if (len > int64_t(kLedMaxPulseMs) * kMsNs) {
         LOG(WARNING) << "pulse of " << len / 1000 << " us would be too long";
         return;
     }
     if (!mLed->budgetAvailable(len)) return;
-    const int64_t t = nextTarget(f.timestampNs, fd, mMarginNs, boottimeNs(), mPreviousTarget,
+    const int64_t t = nextTarget(timestampNs, fd, mMarginNs, boottimeNs(), mPreviousTarget,
                                  mPeriod, mLed->earliestOn(len));
     if (mLed->schedule(t - mMarginNs, t + skew + exposure + mMarginNs, mLedMa)) {
         mTargetTs = t;
@@ -153,10 +155,13 @@ IrisCapture::Result IrisCapture::next(int timeoutMs, std::vector<Probe>* probes)
             return Result::kCameraError;
         }
         Frame& f = mFrame;  // copy-assigned by waitFrame(): keeps its capacity
-        const int waitMs = int(std::min<int64_t>((deadline - now) / kMsNs + 1, 500));
+        // Until the first image arrives (it comes 55-68 ms after its timestamp), poll the shutter
+        // notifications: the first pulse can then be planned about one frame earlier.
+        const int waitMs = int(std::min<int64_t>((deadline - now) / kMsNs + 1, mFirstFrame ? 500 : 5));
         if (!mCamera.waitFrame(mLastSeq, waitMs, &f)) {
             if (mInterrupted) return Result::kInterrupted;
             if (mCamera.failed()) return Result::kCameraError;
+            if (!mFirstFrame) scheduleFrom(mCamera.lastStartTimestamp(), 0);
             continue;
         }
         mFirstFrame = true;
@@ -280,8 +285,18 @@ void IrisCapture::process(const Frame& lit, std::vector<Probe>* probes) {
         p.side = s;
         p.quality.struct_size = sizeof(p.quality);
         iris_template* t = nullptr;
-        p.status = iris_extract_image(mEngine, &img, &t, &p.quality);
+        EyeHint& h = mHints[s];
+        const iris_search_hint hint{h.x, h.y, h.r};
+        p.status = iris_extract_ex(mEngine, mEngineCtx, &img, h.valid ? &hint : nullptr, &t,
+                                   &p.quality);
         p.tmpl.reset(t);
+        if (p.quality.eye_found && p.quality.iris_r > 0.f) {
+            h.valid = true;
+            h.x = p.quality.iris_x, h.y = p.quality.iris_y, h.r = p.quality.iris_r;
+            h.misses = 0;
+        } else if (h.valid && ++h.misses >= 2) {
+            h.valid = false;  // lost for two lit frames (~0.3 s): search the whole half again
+        }
         probes->push_back(std::move(p));
     }
     mProcessed++;

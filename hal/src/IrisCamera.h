@@ -62,6 +62,9 @@ class IrisCamera {
     // ACAMERA_SENSOR_ORIENTATION of the iris camera (clockwise degrees), 90 if unknown.
     int sensorOrientation() const { return mSensorOrientation; }
     int64_t framesReceived() const { return mSequence.load(); }
+    // SENSOR_TIMESTAMP of the last capture started (shutter notify): known about one frame
+    // before the image itself arrives. 0 before the first one.
+    int64_t lastStartTimestamp() const { return mLastStartNs.load(); }
 
   private:
     struct Meta {
@@ -75,6 +78,8 @@ class IrisCamera {
     static void onImageAvailable(void* ctx, AImageReader* reader);
     static void onCaptureCompleted(void* ctx, ACameraCaptureSession* session,
                                    ACaptureRequest* request, const ACameraMetadata* result);
+    static void onCaptureStarted(void* ctx, ACameraCaptureSession* session,
+                                 const ACaptureRequest* request, int64_t timestamp);
     static void onDeviceDisconnected(void* ctx, ACameraDevice* device);
     static void onDeviceError(void* ctx, ACameraDevice* device, int error);
     static void onSessionClosed(void* ctx, ACameraCaptureSession* session);
@@ -107,6 +112,7 @@ class IrisCamera {
     bool mInterrupted = false;
     std::atomic<bool> mError{false};
     std::atomic<int64_t> mSequence{0};
+    std::atomic<int64_t> mLastStartNs{0};
 };
 
 }  // namespace cityman::iris

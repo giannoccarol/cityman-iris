@@ -37,6 +37,21 @@ it are partly lit and ignored; the frame two away is the dark (ambient) referenc
 subtracted. `tests/timing_test.cpp` simulates this with the measured values (7.5 lit frames/s,
 duty <= 33 %).
 
+The first pulse is planned as soon as the camera reports the first started capture (shutter
+notification), before its image arrives: the first lit frame comes about two frames after the
+stream starts instead of three. After that the cadence is K = 4 (duty <= 35 %).
+
+### Speed
+
+- The engine runs with a context kept for the life of the service (no large allocation per frame)
+  and, for each eye, the position found in the previous lit frames as a search hint (dropped after
+  two lit frames without that eye); see the engine README for the measured gains.
+- During enroll/authenticate (`CpuBoost`): the analysis thread is pinned to the A57 cluster when
+  one of its cores is online; `cpu4/core_ctl/min_cpus` is raised to 2 if lower (restored at the
+  end, at service start and by the rc `onrestart` through `vendor.iris.saved_min_cpus`); a perfd
+  lock (opcode 0x1F0C, as the power HAL) sets the A57 floor to 1.25 GHz for at most the operation
+  time. The power-save profile (A57 cluster off through `max_cpus`) is respected.
+
 ### LED limits (Config.h, not overridable)
 
 | Limit | Value | Reason |
@@ -96,7 +111,9 @@ of `enroll`/`enrollWithContext` is not supported.
 
 - `PRODUCT_PACKAGES += android.hardware.biometrics.face-service.cityman` (pulls
   `libcitymaniris_engine`, `libcamera2ndk_vendor` and the AIDL libraries).
-- `BOARD_VENDOR_SEPOLICY_DIRS += vendor/cityman-iris/hal/sepolicy` (or `BOARD_SEPOLICY_DIRS`).
+- `BOARD_VENDOR_SEPOLICY_DIRS += vendor/cityman-iris/hal/sepolicy` (or `BOARD_SEPOLICY_DIRS`). The
+  policy uses the device types `perfd`, `perfd_data_file` and `sysfs_devices_system_cpu`, and
+  `init.cityman.power.sh` must keep giving `cpu4/core_ctl/min_cpus` to `system`.
 - `frameworks/native/data/etc/android.hardware.biometrics.face.xml` in
   `vendor/etc/permissions`, or FaceService does not start.
 - The camera HAL must list the iris camera with `SYSTEM_CAMERA` (or `ro.vendor.camera.mono_ids`

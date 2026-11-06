@@ -57,6 +57,7 @@ IrisCamera::IrisCamera() {
     mSessionCallbacks.onActive = &IrisCamera::onSessionActive;
     mCaptureCallbacks.context = this;
     mCaptureCallbacks.onCaptureCompleted = &IrisCamera::onCaptureCompleted;
+    mCaptureCallbacks.onCaptureStarted = &IrisCamera::onCaptureStarted;
     mListener.context = this;
     mListener.onImageAvailable = &IrisCamera::onImageAvailable;
 }
@@ -114,6 +115,7 @@ bool IrisCamera::open(int exposureUs, int iso, std::string* error) {
     }
     mError = false;
     mSequence = 0;
+    mLastStartNs = 0;
 
     mManager = ACameraManager_create();
     if (!mManager) {
@@ -366,6 +368,11 @@ void IrisCamera::onCaptureCompleted(void* ctx, ACameraCaptureSession*, ACaptureR
             f.skewNs = m.skewNs;
         }
     }
+}
+
+void IrisCamera::onCaptureStarted(void* ctx, ACameraCaptureSession*, const ACaptureRequest*,
+                                  int64_t timestamp) {
+    static_cast<IrisCamera*>(ctx)->mLastStartNs = timestamp;
 }
 
 void IrisCamera::onDeviceDisconnected(void* ctx, ACameraDevice*) {
