@@ -1,0 +1,5 @@
+build/
+*.tpl
+*.ppm
+# synthetic eye generator: unfinished, not part of the build
+tests/synth_eye.*
