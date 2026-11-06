@@ -83,6 +83,21 @@ iris_template_destroy(probe); iris_template_destroy(enrolled); iris_engine_destr
 sfocatura, contrasto di limbo e pupilla, copertura palpebrale, frazione di bit utili, presenza del
 glint del LED ed esposizione. Servono alla UI per guidare l'utente.
 
+### API 2: contesto e posizione suggerita (7/11/2026)
+
+```c
+iris_context *ctx;
+iris_context_create(eng, &ctx);              /* uno per thread: buffer riusati */
+iris_search_hint hint = {q.iris_x, q.iris_y, q.iris_r};   /* dal fotogramma precedente */
+iris_extract_ex(eng, ctx, &img, &hint, &tpl, &q);         /* hint e ctx possono essere NULL */
+iris_context_destroy(ctx);
+```
+
+`IRIS_ENGINE_API_VERSION` è 2; le funzioni della versione 1 restano invariate (stesso risultato
+di `iris_extract_ex` senza contesto né suggerimento). Con il suggerimento l'occhio si cerca prima
+in una finestra di circa 2,2 raggi attorno alla posizione data; se lì non c'è, si cerca nell'intera
+immagine come prima.
+
 ## Pipeline e scelte
 
 1. **Ingresso.**
@@ -182,6 +197,8 @@ iris_cli extract dump.raw --raw10 1920 1088 2400 -o a.tpl    # RAW10 MIPI (strid
 iris_cli extract dump.raw --raw16 1920 1088 10 --roi 800 300 600 500
 iris_cli match a.tpl b.tpl
 iris_cli enroll user.tpl s1.tpl s2.tpl s3.tpl s4.tpl
+iris_cli extract frame.pgm --hint-auto --bench 20            # tempi: senza/con contesto/con hint
+iris_cli extract frame.pgm --hint 900 520 85 -o a.tpl        # ricerca prima attorno a (900, 520)
 ```
 
 `--debug` scrive un PPM con il ritaglio attorno all'occhio:
@@ -271,6 +288,41 @@ questa macchina: l'unica verifica è la compilazione clang con `-fno-exceptions 
 
 Va moltiplicata per il numero di shift e di codici confrontati (21 × 5). Il dato vero sarà quello
 delle catture reali.
+
+## Velocità (API 2, 7/11/2026)
+
+Misure sull'host (Core Ultra 7 155H, core P, clang -O2, 1 thread) su un occhio sintetico
+1920×1080 (iride r 85, pupilla r 32, `tests/eye_frame.h`), mediana di 30 chiamate:
+
+| | prima | dopo |
+|---|---|---|
+| extract con occhio | 26–29 ms | 11,9 ms |
+| `iris_extract_ex` con contesto | – | 10,0 ms |
+| con contesto e posizione suggerita | – | 7,4 ms |
+| fotogramma senza occhio | 5,5 ms | 2,6 ms |
+| allocazioni per chiamata (con contesto) | 474 / 4,6 MB | 349 / 82 KB |
+
+Da dove viene il guadagno:
+- **Ricerca della pupilla.** Con la configurazione di default girava a piena risoluzione:
+  `int(4.8f / 2.4f)` vale 1 in float. Ora usa il fattore 2 previsto dal progetto. Il fattore 4
+  perde le pupille piccole (r 15 su iride 50) ed è stato scartato.
+- **Conversione dell'ingresso.** Il fotogramma non viene più convertito tutto: l'istogramma e il
+  guadagno restano identici; si convertono solo l'immagine ridotta (media 2×2 dei codici grezzi,
+  poi guadagno) e i ritagli attorno ai candidati.
+- **Stesse operazioni, meno ripetute:** `max_radius()` della pupilla calcolato una volta nel limbo
+  e non a ogni prova; nell'anello dell'iride prima i test economici e la trigonometria solo vicino
+  alla pupilla; `bilinear` e l'arrotondamento inline; smoothing del codice solo sulle 16 righe
+  usate; conteggio della validità con somme prefisse; blur senza clamp all'interno. Queste parti
+  danno risultati identici bit per bit, verificato confrontando i template.
+
+Differenza rispetto a prima: i candidati nascono dall'immagine a metà risoluzione invece che da
+quella intera, quindi il livello della pupilla usato per la soglia delle ciglia cambia di poco. Sui
+5 occhi di prova: bit di codice validi in entrambi identici (distanza 0,0000 contro i template di
+prima), 20–278 bit di maschera su 16384 diversi (≤ 1,7 %), bit validi ±0,1 %.
+
+Sul telefono: `hal/tests/out/bench-android/run-bench.sh` (vecchio e nuovo `iris_cli` per arm64,
+stessi fotogrammi). Prima dell'ottimizzazione il coordinatore aveva misurato 131 ms su A57 e
+240 ms su A53 con un occhio sintetico.
 
 ## Limiti
 

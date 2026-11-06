@@ -2,6 +2,7 @@
 //
 //   iris_cli extract IMAGE [--raw10 W H [STRIDE] | --raw16 W H [BITS]] [--roi X Y W H]
 //                          [-o OUT.tpl] [--debug OUT.ppm] [--min-r R] [--max-r R]
+//                          [--hint X Y R | --hint-auto] [--bench N]
 //   iris_cli match A.tpl B.tpl
 //   iris_cli enroll OUT.tpl IN1.tpl IN2.tpl ...
 //
@@ -9,6 +10,11 @@
 // (headerless dump, e.g. from the RDI path). --debug writes the crop around the eye with the
 // segmentation drawn (green pupil, red limbus, blue eyelids, purple masked pixels) and the
 // rubber sheet below it.
+// --hint X Y R searches around an iris at (X, Y) with radius R first (as the HAL does with the
+// position of the previous frame); --hint-auto takes it from a first run without hint. --bench N
+// then times N extractions without context, with a context and with context + hint
+// (median / min / mean), for the timing on the phone (taskset to pick a core).
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -175,6 +181,7 @@ int usage() {
                  "usage:\n"
                  "  iris_cli extract IMAGE [--raw10 W H [STRIDE] | --raw16 W H [BITS]] [--roi X Y W H]\n"
                  "                         [-o OUT.tpl] [--debug OUT.ppm] [--min-r R] [--max-r R]\n"
+                 "                         [--hint X Y R | --hint-auto] [--bench N]\n"
                  "  iris_cli match A.tpl B.tpl\n"
                  "  iris_cli enroll OUT.tpl IN1.tpl IN2.tpl ...\n");
     return 2;
@@ -187,6 +194,9 @@ int cmd_extract(int argc, char **argv) {
     int raw = 0, rw = 0, rh = 0, rs = 0, bits = 10;
     iris_config cfg;
     iris_config_default(&cfg);
+    Hint hint;
+    bool hint_auto = false;
+    int bench = 0;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         auto need = [&](int k) { return i + k < argc; };
@@ -211,6 +221,14 @@ int cmd_extract(int argc, char **argv) {
             cfg.min_iris_radius = float(std::atof(argv[++i]));
         } else if (a == "--max-r" && need(1)) {
             cfg.max_iris_radius = float(std::atof(argv[++i]));
+        } else if (a == "--hint" && need(3)) {
+            hint.x = float(std::atof(argv[++i]));
+            hint.y = float(std::atof(argv[++i]));
+            hint.r = float(std::atof(argv[++i]));
+        } else if (a == "--hint-auto") {
+            hint_auto = true;
+        } else if (a == "--bench" && need(1)) {
+            bench = std::max(0, std::atoi(argv[++i]));
         } else {
             return usage();
         }
@@ -253,7 +271,8 @@ int cmd_extract(int argc, char **argv) {
     iris_quality q;
     std::memset(&q, 0, sizeof(q));
     q.struct_size = sizeof(q);
-    iris_status st = citymaniris::extract(*e, img, &t, &q, &d);
+    Scratch sc;
+    iris_status st = citymaniris::extract(*e, sc, img, hint.r > 0.f ? &hint : nullptr, &t, &q, &d);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("status: %s (%d), %.1f ms\n", iris_status_string(st), int(st), ms);
     std::printf("exposure %.3f  eye %d  glint %d\n", double(q.exposure), q.eye_found, q.glint_found);
@@ -265,6 +284,35 @@ int cmd_extract(int argc, char **argv) {
     std::printf("eyelid coverage %.2f  usable bits %.2f  overall %.0f\n", double(q.eyelid_coverage),
                 double(q.usable_fraction), double(q.overall));
     if (dbg) write_debug(dbg, img, d);
+    if (bench > 0) {
+        iris_search_hint h{hint.x, hint.y, hint.r};
+        if (hint_auto && q.eye_found) h = iris_search_hint{q.iris_x, q.iris_y, q.iris_r};
+        iris_context *ctx = nullptr;
+        iris_context_create(e, &ctx);
+        auto timeit = [&](const char *name, iris_context *c, const iris_search_hint *hp) {
+            std::vector<double> v;
+            iris_status s2 = IRIS_OK;
+            for (int k = 0; k < bench; ++k) {
+                iris_template *tt = nullptr;
+                const auto a0 = std::chrono::steady_clock::now();
+                s2 = iris_extract_ex(e, c, &img, hp, &tt, nullptr);
+                v.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count());
+                iris_template_destroy(tt);
+            }
+            std::sort(v.begin(), v.end());
+            double sum = 0;
+            for (double x : v) sum += x;
+            std::printf("bench %-16s %d runs: median %.1f ms  min %.1f ms  mean %.1f ms  (%s)\n", name, bench,
+                        v[v.size() / 2], v.front(), sum / double(v.size()), iris_status_string(s2));
+        };
+        timeit("no context", nullptr, nullptr);
+        timeit("context", ctx, nullptr);
+        if (h.r > 0.f) {
+            std::printf("hint (%.1f, %.1f) r %.1f\n", double(h.x), double(h.y), double(h.r));
+            timeit("context + hint", ctx, &h);
+        }
+        iris_context_destroy(ctx);
+    }
     int rc = st == IRIS_OK ? 0 : 1;
     if (t && out && !save_template(out, t)) {
         std::fprintf(stderr, "cannot write %s\n", out);

@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "eye_frame.h"
 #include "iris_engine.h"
 #include "iris_internal.h"
 
@@ -508,6 +509,94 @@ void bench(const iris_engine *e) {
     }
 }
 
+// API 2: iris_extract_ex with a context and a search hint gives the template of the full search.
+std::vector<uint8_t> serialized(const iris_template *t) {
+    size_t n = 0;
+    iris_template_serialize(t, nullptr, 0, &n);
+    std::vector<uint8_t> b(n);
+    if (iris_template_serialize(t, b.data(), b.size(), &n) != IRIS_OK) b.clear();
+    return b;
+}
+
+void test_context_hint(const iris_engine *e) {
+    CHECK(iris_engine_api_version() >= 2);
+    iris_context *ctx = nullptr;
+    CHECK(iris_context_create(nullptr, &ctx) == IRIS_E_INVALID_ARGUMENT && !ctx);
+    CHECK(iris_context_create(e, &ctx) == IRIS_OK && ctx);
+    eyeframe::Params p;  // 1920x1080, iris r 85 at (900, 520)
+    const auto frame = eyeframe::render(p);
+    eyeframe::Params p2 = p;
+    p2.cx = 1350.f, p2.cy = 380.f, p2.iris_r = 70.f, p2.pupil_r = 26.f, p2.texture_seed = 7;
+    p2.sclera_a = 200.f, p2.sclera_b = 100.f;
+    const auto frame2 = eyeframe::render(p2);
+    iris_image img{};
+    img.data = frame.data(), img.width = p.width, img.height = p.height, img.format = IRIS_PIX_GRAY8;
+
+    iris_template *full = nullptr;
+    iris_quality qf{};
+    qf.struct_size = sizeof(qf);
+    CHECK(iris_extract_ex(e, nullptr, &img, nullptr, &full, &qf) == IRIS_OK && full);
+    CHECK(std::hypot(qf.iris_x - p.cx, qf.iris_y - p.cy) < 1.5f && std::fabs(qf.iris_r - p.iris_r) < 1.5f);
+    // Same as the API 1 entry point, byte for byte.
+    iris_template *v1 = nullptr;
+    CHECK(iris_extract_image(e, &img, &v1, nullptr) == IRIS_OK && v1);
+    CHECK(serialized(full) == serialized(v1));
+
+    // Hint near the eye (as from the previous frame, a few pixels off).
+    const iris_search_hint near_hint{qf.iris_x + 9.f, qf.iris_y - 6.f, qf.iris_r};
+    iris_template *hinted = nullptr;
+    iris_quality qh{};
+    qh.struct_size = sizeof(qh);
+    CHECK(iris_extract_ex(e, ctx, &img, &near_hint, &hinted, &qh) == IRIS_OK && hinted);
+    float score = 1.f;
+    CHECK(hinted && iris_match(e, full, hinted, &score) == IRIS_OK);
+    std::printf("  hint near the eye: score vs full search %.4f, iris (%.2f, %.2f) vs (%.2f, %.2f)\n", double(score),
+                double(qh.iris_x), double(qh.iris_y), double(qf.iris_x), double(qf.iris_y));
+    CHECK(score <= 0.05f);
+    CHECK(std::hypot(qh.iris_x - qf.iris_x, qh.iris_y - qf.iris_y) < 0.5f);
+
+    // Hint far from the eye: falls back to the whole frame.
+    const iris_search_hint far_hint{1700.f, 900.f, 80.f};
+    iris_template *fallback = nullptr;
+    CHECK(iris_extract_ex(e, ctx, &img, &far_hint, &fallback, nullptr) == IRIS_OK && fallback);
+    CHECK(fallback && iris_match(e, full, fallback, &score) == IRIS_OK && score <= 0.05f);
+
+    // A reused context gives the same bytes as a fresh one, also after another frame.
+    img.data = frame2.data();
+    iris_template *other = nullptr, *other_fresh = nullptr;
+    CHECK(iris_extract_ex(e, ctx, &img, nullptr, &other, nullptr) == IRIS_OK);
+    CHECK(iris_extract_ex(e, nullptr, &img, nullptr, &other_fresh, nullptr) == IRIS_OK);
+    CHECK(other && other_fresh && serialized(other) == serialized(other_fresh));
+    img.data = frame.data();
+    iris_template *again = nullptr;
+    CHECK(iris_extract_ex(e, ctx, &img, nullptr, &again, nullptr) == IRIS_OK);
+    CHECK(again && serialized(again) == serialized(full));
+
+    // Micro-benchmark on the 1920x1080 frame (host, 1 thread).
+    auto best_of = [&](const iris_search_hint *h, iris_context *c, const std::vector<uint8_t> &data) {
+        img.data = data.data();
+        double best = 1e9;
+        for (int k = 0; k < 9; ++k) {
+            iris_template *t = nullptr;
+            double a = now_ms();
+            iris_extract_ex(e, c, &img, h, &t, nullptr);
+            best = std::min(best, now_ms() - a);
+            iris_template_destroy(t);
+        }
+        return best;
+    };
+    std::vector<uint8_t> empty(frame.size());
+    for (size_t i = 0; i < empty.size(); ++i) empty[i] = uint8_t(90 + (i * 2654435761u >> 28));
+    std::printf("  timing 1920x1080 eye frame: no context %.1f ms, context %.1f ms, context + hint %.1f ms; "
+                "no eye %.1f ms\n",
+                best_of(nullptr, nullptr, frame), best_of(nullptr, ctx, frame), best_of(&near_hint, ctx, frame),
+                best_of(nullptr, ctx, empty));
+
+    for (iris_template *t : {full, v1, hinted, fallback, other, other_fresh, again}) iris_template_destroy(t);
+    iris_context_destroy(ctx);
+    iris_context_destroy(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -523,6 +612,7 @@ int main() {
     test_serialization(e);
     test_enroll(e);
     test_threads(e);
+    test_context_hint(e);
     bench(e);
     iris_engine_destroy(e);
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
