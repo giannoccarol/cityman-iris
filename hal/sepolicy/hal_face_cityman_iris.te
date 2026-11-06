@@ -1,0 +1,31 @@
+# cityman iris face HAL (android.hardware.biometrics.face-service.cityman)
+type hal_face_cityman_iris, domain;
+hal_server_domain(hal_face_cityman_iris, hal_face)
+
+type hal_face_cityman_iris_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(hal_face_cityman_iris)
+
+# Iris camera through cameraserver (vendor client of android.frameworks.cameraservice). The
+# camera service calls back into the process and fills buffers allocated here.
+allow hal_face_cityman_iris fwk_camera_service:service_manager find;
+binder_call(hal_face_cityman_iris, cameraserver)
+binder_call(cameraserver, hal_face_cityman_iris)
+allow cameraserver hal_face_cityman_iris:fd use;
+allow hal_face_cityman_iris cameraserver:fd use;
+hal_client_domain(hal_face_cityman_iris, hal_graphics_allocator)
+allow hal_face_cityman_iris hal_graphics_allocator:fd use;
+
+# IR emitter: led:torch_0 and led:torch_1 (qpnp-flash-led, sysfs_leds in genfs_contexts).
+allow hal_face_cityman_iris sysfs_leds:dir search;
+allow hal_face_cityman_iris sysfs_leds:lnk_file read;
+allow hal_face_cityman_iris sysfs_leds:file rw_file_perms;
+
+# Sealing key / debug frames in /data/vendor/iris; templates in /data/vendor_de/<user>/facedata
+# (face_vendor_data_file, already granted to hal_face servers).
+allow hal_face_cityman_iris vendor_data_file:dir search;
+allow hal_face_cityman_iris iris_vendor_data_file:dir create_dir_perms;
+allow hal_face_cityman_iris iris_vendor_data_file:file create_file_perms;
+
+# Tuning properties and ro.vendor.camera.mono_ids (fallback camera lookup).
+get_prop(hal_face_cityman_iris, vendor_iris_prop)
+get_prop(hal_face_cityman_iris, vendor_default_prop)

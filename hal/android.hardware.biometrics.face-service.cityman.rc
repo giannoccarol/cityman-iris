@@ -1,0 +1,20 @@
+# cityman iris face HAL. The IR emitter is fed by both PMI8994 torch channels (their currents
+# add up); only this service may drive them.
+on post-fs
+    chown system system /sys/class/leds/led:torch_0/brightness
+    chown system system /sys/class/leds/led:torch_1/brightness
+    chmod 0660 /sys/class/leds/led:torch_0/brightness
+    chmod 0660 /sys/class/leds/led:torch_1/brightness
+    write /sys/class/leds/led:torch_0/brightness 0
+    write /sys/class/leds/led:torch_1/brightness 0
+
+on post-fs-data
+    mkdir /data/vendor/iris 0700 system system
+
+service vendor.face-cityman /vendor/bin/hw/android.hardware.biometrics.face-service.cityman
+    class hal
+    user system
+    group system camera
+    # Never leave the emitter lit if the service dies mid-pulse.
+    onrestart write /sys/class/leds/led:torch_0/brightness 0
+    onrestart write /sys/class/leds/led:torch_1/brightness 0

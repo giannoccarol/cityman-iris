@@ -1,0 +1,2 @@
+/(vendor|system/vendor)/bin/hw/android\.hardware\.biometrics\.face-service\.cityman  u:object_r:hal_face_cityman_iris_exec:s0
+/data/vendor/iris(/.*)?                                                                u:object_r:iris_vendor_data_file:s0
