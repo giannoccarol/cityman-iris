@@ -1,2 +1,2 @@
 # Template sealing key and optional debug frames of the iris face HAL.
-type iris_vendor_data_file, file_type, data_file_type;
+type cityman_iris_data_file, file_type, data_file_type;

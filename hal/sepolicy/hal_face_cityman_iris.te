@@ -23,8 +23,8 @@ allow hal_face_cityman_iris sysfs_leds:file rw_file_perms;
 # Sealing key / debug frames in /data/vendor/iris; templates in /data/vendor_de/<user>/facedata
 # (face_vendor_data_file, already granted to hal_face servers).
 allow hal_face_cityman_iris vendor_data_file:dir search;
-allow hal_face_cityman_iris iris_vendor_data_file:dir create_dir_perms;
-allow hal_face_cityman_iris iris_vendor_data_file:file create_file_perms;
+allow hal_face_cityman_iris cityman_iris_data_file:dir create_dir_perms;
+allow hal_face_cityman_iris cityman_iris_data_file:file create_file_perms;
 
 # Tuning properties and ro.vendor.camera.mono_ids (fallback camera lookup).
 get_prop(hal_face_cityman_iris, vendor_iris_prop)
