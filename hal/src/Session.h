@@ -21,6 +21,7 @@
 #include <aidl/android/hardware/biometrics/face/ISessionCallback.h>
 
 #include "IrLed.h"
+#include "PreviewSink.h"
 #include "IrisPipeline.h"
 #include "TemplateStore.h"
 #include "iris_engine.h"
@@ -95,7 +96,7 @@ class Session : public BnSession {
     void scheduleLockoutCleared(int64_t delayMs);
 
     void doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
-                  const std::vector<Feature>& features);
+                  const std::vector<Feature>& features, std::shared_ptr<ANativeWindow> preview);
     void doAuthenticate(uint64_t opId, int64_t operationId);
     bool checkLockout(cityman::iris::TemplateStore& store, cityman::iris::UserState& state);
     void recordFailure(cityman::iris::TemplateStore& store, cityman::iris::UserState& state);

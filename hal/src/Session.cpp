@@ -16,6 +16,7 @@
 #include <sstream>
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <openssl/rand.h>
 
 #include "Config.h"
@@ -295,7 +296,9 @@ ndk::ScopedAStatus Session::enroll(const keymaster::HardwareAuthToken& hat, Enro
                                    const std::vector<Feature>& features,
                                    const std::optional<NativeHandle>&,
                                    std::shared_ptr<common::ICancellationSignal>* out) {
-    *out = post([this, hat, features](uint64_t id) { doEnroll(id, hat, features); });
+    // The deprecated NativeHandle preview is not supported (Settings passes a Surface through
+    // enrollWithOptions on Android 16).
+    *out = post([this, hat, features](uint64_t id) { doEnroll(id, hat, features, nullptr); });
     return ndk::ScopedAStatus::ok();
 }
 
@@ -310,10 +313,18 @@ ndk::ScopedAStatus Session::enrollWithContext(const keymaster::HardwareAuthToken
 
 ndk::ScopedAStatus Session::enrollWithOptions(const FaceEnrollOptions& options,
                                               std::shared_ptr<common::ICancellationSignal>* out) {
-    // The preview surface (if any) is ignored: the iris image is not shown to the user.
     const auto hat = options.hardwareAuthToken;
     const auto features = options.features;
-    *out = post([this, hat, features](uint64_t id) { doEnroll(id, hat, features); });
+    // Settings' square preview Surface: the HAL draws the IR enrollment preview into it.
+    std::shared_ptr<ANativeWindow> preview;
+    if (options.surfacePreview && options.surfacePreview->get()) {
+        ANativeWindow* w = options.surfacePreview->get();
+        ANativeWindow_acquire(w);
+        preview.reset(w, ANativeWindow_release);
+    }
+    *out = post([this, hat, features, preview](uint64_t id) {
+        doEnroll(id, hat, features, preview);
+    });
     return ndk::ScopedAStatus::ok();
 }
 
@@ -468,7 +479,8 @@ ndk::ScopedAStatus Session::close() {
 // ------------------------------------------------------------------------------ enrollment
 
 void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
-                       const std::vector<Feature>& features) {
+                       const std::vector<Feature>& features,
+                       std::shared_ptr<ANativeWindow> preview) {
     if (opCancelled(opId)) {
         mCb->onError(Error::CANCELED, 0);
         return;
@@ -509,6 +521,17 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
     }
     mLastInfoMs = 0;
     sendEnrollFrame(AcquiredInfo::START, 0, EnrollmentStage::UNKNOWN);
+
+    // Enrollment preview. Rotation: the sensor orientation unless overridden (the real
+    // orientation of the iris module still has to be checked on the phone); mirrored like a
+    // front camera.
+    std::unique_ptr<PreviewSink> sink;
+    if (preview) sink = std::make_unique<PreviewSink>(preview.get());
+    int rotation = ::android::base::GetIntProperty("persist.vendor.iris.preview_rotation", -1);
+    if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) {
+        rotation = capture.sensorOrientation();
+    }
+    const bool mirror = ::android::base::GetBoolProperty("persist.vendor.iris.preview_mirror", true);
 
     std::vector<TemplatePtr> samples[2];
     bool firstFrame = false;
@@ -554,6 +577,24 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
             v.push_back(std::move(p.tmpl));
             if (v.size() > size_t(kEnrollMaxSamples)) v.erase(v.begin());
             added = true;
+        }
+        if (sink) {
+            PreviewEye eyes[2];
+            for (const auto& p : probes) {
+                PreviewEye& e = eyes[p.side & 1];
+                e.found = p.quality.eye_found != 0 && p.quality.iris_r > 0.f;
+                e.good = p.status == IRIS_OK;
+                e.irisX = p.quality.iris_x;
+                e.irisY = p.quality.iris_y;
+                e.irisR = p.quality.iris_r;
+                e.pupilX = p.quality.pupil_x;
+                e.pupilY = p.quality.pupil_y;
+                e.pupilR = p.quality.pupil_r;
+            }
+            for (int s = 0; s < 2; s++) {
+                eyes[s].progress = std::min(1.f, float(samples[s].size()) / kEnrollTargetSamples);
+            }
+            sink->submit(capture.lastLit(), eyes, rotation, mirror);
         }
         sendEnrollFrame(info, vendor,
                         added ? EnrollmentStage::HOLD_STILL_IN_CENTER

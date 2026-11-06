@@ -58,6 +58,22 @@ eye and builds a template per eye once one eye has 6; authentication accepts the
 that matches any stored eye, and counts one failure after 3 good non-matching frames or a
 timeout with good frames. Lockout: timed (30 s) every 5 failures, permanent after 20.
 
+### Enrollment preview
+
+On Android 16 Settings passes a Surface in `FaceEnrollOptions.surfacePreview`; the HAL draws an
+IR preview into it (`Preview.cpp`, `PreviewSink.cpp`). Only lit frames are shown (about 7.5 per
+second): rotated by `ACAMERA_SENSOR_ORIENTATION` and mirrored like a front camera, a square crop
+that follows the eyes with exponential smoothing of centre and zoom, bilinear sampling (from a
+2x2 box-filtered half image when downscaling), percentile contrast stretch, gamma 0.85, a cold
+monochrome ramp (#0B1A2A shadows to #CDEFFF / near-white highlights) and a soft vignette. For each
+eye found: an antialiased ring around the iris (teal #4DD0E1 when the sample is good, amber
+#FFB74D otherwise), a small ring on the pupil, and a progress arc that fills with the samples
+collected for that eye. Rendering runs on its own thread with a one-frame slot (frames are
+dropped while it is busy) and allocates nothing per frame; if the Surface dies (Settings paused)
+drawing stops and enrollment goes on. `tests/preview_test.cpp` renders a synthetic two-eye frame
+and a real frame to PPM (host: about 5 ms per 720x720 frame). The deprecated NativeHandle preview
+of `enroll`/`enrollWithContext` is not supported.
+
 ## Tuning properties (root, `setprop`)
 
 | Property | Default | Range |
@@ -72,6 +88,8 @@ timeout with good frames. Lockout: timed (30 s) every 5 failures, permanent afte
 | `persist.vendor.iris.min_radius` / `max_radius` | 40 / 130 px | engine geometry |
 | `persist.vendor.iris.threshold` | 0.36 | 0.20-0.40 |
 | `persist.vendor.iris.camera_id` | auto | force a camera id |
+| `persist.vendor.iris.preview_rotation` | sensor orientation | 0, 90, 180, 270 |
+| `persist.vendor.iris.preview_mirror` | true | mirror the preview like a front camera |
 | `persist.vendor.iris.dump` | false | save up to 64 lit frames to `/data/vendor/iris/dump` (biometric data!) |
 
 ## Integration (device tree)

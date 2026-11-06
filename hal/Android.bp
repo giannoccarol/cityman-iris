@@ -15,6 +15,8 @@ cc_binary {
         "src/Session.cpp",
         "src/Timing.cpp",
         "src/TemplateStore.cpp",
+        "src/Preview.cpp",
+        "src/PreviewSink.cpp",
         "src/main.cpp",
     ],
     local_include_dirs: ["src"],
