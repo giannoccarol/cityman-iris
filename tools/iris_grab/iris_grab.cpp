@@ -129,6 +129,14 @@ struct State {
 };
 
 State gS;
+int64_t gT0 = 0;
+std::atomic<bool> gFirstFrame{false};
+void stamp(const char *what) {
+    timespec t{};
+    clock_gettime(CLOCK_BOOTTIME, &t);
+    int64_t now = int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
+    if (getenv("IRIS_GRAB_TIMING")) std::fprintf(stderr, "t+%4lld ms %s\n", (long long)((now - gT0) / 1000000), what);
+}
 
 bool write_file(const std::string &path, const void *data, size_t len) {
     FILE *f = std::fopen(path.c_str(), "wb");
@@ -282,6 +290,7 @@ void sleep_until_boottime(int64_t t) {
 void on_yuv(void *, AImageReader *r) {
     AImage *img = nullptr;
     if (AImageReader_acquireNextImage(r, &img) != AMEDIA_OK || !img) return;
+    if (!gFirstFrame.exchange(true)) stamp("first frame");
     int64_t ts = 0;
     AImage_getTimestamp(img, &ts);
     if (gS.opt.pulse_total_ms > 0) {
@@ -413,6 +422,11 @@ int main(int argc, char **argv) {
     std::string mk = "mkdir -p '" + o.out + "'";
     if (std::system(mk.c_str()) != 0) return std::fprintf(stderr, "cannot create %s\n", o.out.c_str()), 1;
 
+    {
+        timespec t{};
+        clock_gettime(CLOCK_BOOTTIME, &t);
+        gT0 = int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
+    }
     if (!start_binder_pool()) std::fprintf(stderr, "warning: no binder thread pool\n");
     ACameraManager *mgr = ACameraManager_create();
     ACameraMetadata *chars = nullptr;
@@ -425,7 +439,9 @@ int main(int argc, char **argv) {
 
     ACameraDevice_StateCallbacks dcb{nullptr, dev_disconnected, dev_error};
     ACameraDevice *dev = nullptr;
+    stamp("open");
     camera_status_t st = ACameraManager_openCamera(mgr, o.id.c_str(), &dcb, &dev);
+    stamp("opened");
     if (st != ACAMERA_OK) return std::fprintf(stderr, "openCamera: %d\n", st), 1;
 
     AImageReader *raw_r = nullptr, *yuv_r = nullptr;
@@ -452,6 +468,7 @@ int main(int argc, char **argv) {
     ACameraCaptureSession_stateCallbacks scb{nullptr, sess_noop, sess_noop, sess_noop};
     ACameraCaptureSession *sess = nullptr;
     st = ACameraDevice_createCaptureSession(dev, outs, &scb, &sess);
+    stamp("session");
     if (st != ACAMERA_OK) return std::fprintf(stderr, "createCaptureSession: %d\n", st), 1;
 
     ACameraOutputTarget *raw_t = nullptr, *yuv_t = nullptr;
