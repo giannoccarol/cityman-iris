@@ -1,0 +1,6 @@
+{
+  global:
+    iris_*;
+  local:
+    *;
+};

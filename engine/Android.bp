@@ -25,6 +25,8 @@ cc_defaults {
 cc_library_shared {
     name: "libcitymaniris_engine",
     defaults: ["libcitymaniris_engine_defaults"],
+    // export only the C API (iris_*)
+    version_script: "libcitymaniris_engine.map.txt",
 }
 
 cc_library_static {

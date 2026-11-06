@@ -23,7 +23,10 @@ set_target_properties(citymaniris_engine_static PROPERTIES POSITION_INDEPENDENT_
 
 add_library(citymaniris_engine SHARED ${IRIS_SOURCES})
 target_include_directories(citymaniris_engine PUBLIC include PRIVATE src)
-target_compile_options(citymaniris_engine PRIVATE ${IRIS_WARNINGS} -fvisibility=hidden)
+target_compile_options(citymaniris_engine PRIVATE ${IRIS_WARNINGS} -fvisibility=hidden -fvisibility-inlines-hidden)
+if(NOT APPLE)
+  target_link_options(citymaniris_engine PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcitymaniris_engine.map.txt")
+endif()
 
 add_executable(iris_unit_tests tests/unit_tests.cpp)
 target_include_directories(iris_unit_tests PRIVATE src)
