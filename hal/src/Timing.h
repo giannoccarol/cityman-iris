@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 The LineageOS Project
+ * SPDX-FileCopyrightText: 2026 giannoccarol
  * SPDX-License-Identifier: Apache-2.0
  *
  * Frame/pulse timing of the iris capture. No Android dependency: tested on the host
