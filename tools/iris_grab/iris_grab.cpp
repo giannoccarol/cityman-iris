@@ -118,7 +118,7 @@ struct State {
     Options opt;
     int raw_w = 0, raw_h = 0, yuv_w = 0, yuv_h = 0;
     bool capturing = false;
-    int raw_saved = 0, yuv_saved = 0, yuv_seen = 0;
+    int raw_saved = 0, yuv_saved = 0, yuv_seen = 0, raw_seen = 0;
     int failed = 0;
     std::map<int64_t, FrameMeta> meta;  // keyed by sensor timestamp
     std::vector<int64_t> raw_ts, yuv_ts;
@@ -229,6 +229,10 @@ void save_y(AImage *img, int idx) {
 void on_raw(void *, AImageReader *r) {
     AImage *img = nullptr;
     if (AImageReader_acquireNextImage(r, &img) != AMEDIA_OK || !img) return;
+    {
+        std::lock_guard<std::mutex> l(gS.m);
+        gS.raw_seen++;
+    }
     int64_t ts = 0;
     AImage_getTimestamp(img, &ts);
     int idx = -1;
@@ -495,6 +499,8 @@ int main(int argc, char **argv) {
     ACaptureRequest *prev = nullptr, *still = nullptr;
     ACameraDevice_createCaptureRequest(dev, TEMPLATE_PREVIEW, &prev);
     ACaptureRequest_addTarget(prev, yuv_t);
+    // IRIS_GRAB_RAW_REPEATING=1: also stream RAW16 in the repeating request (iris HAL test).
+    if (getenv("IRIS_GRAB_RAW_REPEATING") && raw_t) ACaptureRequest_addTarget(prev, raw_t);
     setup(prev);
     ACameraDevice_createCaptureRequest(dev, TEMPLATE_STILL_CAPTURE, &still);
     if (raw_t) ACaptureRequest_addTarget(still, raw_t);
@@ -591,6 +597,7 @@ int main(int argc, char **argv) {
         }
         std::printf("callback latency mean %.1f ms max %.1f ms\n", gS.n_cb ? gS.sum_cb_latency / 1e6 / gS.n_cb : 0.0,
                     gS.max_cb_latency / 1e6);
+        std::printf("raw frames in the repeating stream: %d\n", gS.raw_seen);
         std::printf("pulse mode: %zu frames, %zu pulses (%d mA, ch %d), frame %lld ns, skew %lld ns -> %s\n",
                     gS.frame_stats.size(), gS.pulses.size(), o.led_ma, o.led_channel, (long long)gS.frame_duration_ns,
                     (long long)gS.skew_ns, o.out.c_str());
