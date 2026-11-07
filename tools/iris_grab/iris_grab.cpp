@@ -89,6 +89,7 @@ struct Options {
     // Frame-locked mode (-S K,TOTAL ms): light one whole frame every K frames, timing the pulse
     // from the previous frame's timestamp, frame duration and rolling shutter skew.
     int sync_k = 0;
+    int jpeg_orientation = -1;  // -J DEG: also capture a JPEG with this ANDROID_JPEG_ORIENTATION
 };
 
 struct FrameStat {
@@ -324,6 +325,28 @@ void on_yuv(void *, AImageReader *r) {
     }
 }
 
+int gJpegSaved = 0;
+void on_jpeg(void *, AImageReader *r) {
+    AImage *img = nullptr;
+    if (AImageReader_acquireNextImage(r, &img) != AMEDIA_OK || !img) return;
+    uint8_t *data = nullptr;
+    int len = 0;
+    if (AImage_getPlaneData(img, 0, &data, &len) == AMEDIA_OK && data && len > 0) {
+        // The BLOB buffer is padded: the JPEG ends at the EOI marker.
+        int end = len;
+        for (int i = len - 2; i > 0; i--)
+            if (data[i] == 0xff && data[i + 1] == 0xd9) { end = i + 2; break; }
+        char name[64];
+        std::lock_guard<std::mutex> l(gS.m);
+        std::snprintf(name, sizeof name, "/frame_%d.jpg", gJpegSaved);
+        write_file(gS.opt.out + name, data, end);
+        std::printf("jpeg %d: %d bytes (orientation %d)\n", gJpegSaved, end, gS.opt.jpeg_orientation);
+        gJpegSaved++;
+        gS.cv.notify_all();
+    }
+    AImage_delete(img);
+}
+
 void cap_completed(void *, ACameraCaptureSession *, ACaptureRequest *, const ACameraMetadata *res) {
     FrameMeta fm;
     ACameraMetadata_const_entry e{};
@@ -388,7 +411,7 @@ int usage() {
 int main(int argc, char **argv) {
     Options &o = gS.opt;
     int c;
-    while ((c = getopt(argc, argv, "c:n:e:i:l:L:p:S:w:o:xh")) != -1) {
+    while ((c = getopt(argc, argv, "c:n:e:i:l:L:p:S:J:w:o:xh")) != -1) {
         switch (c) {
             case 'c': o.id = optarg; break;
             case 'n': o.frames = std::atoi(optarg); break;
@@ -399,6 +422,7 @@ int main(int argc, char **argv) {
             case 'o': o.out = optarg; break;
             case 'x': o.colour = true; break;
             case 'L': o.led_channel = std::atoi(optarg); break;
+            case 'J': o.jpeg_orientation = std::atoi(optarg); break;
             case 'S':
                 if (std::sscanf(optarg, "%d,%d", &o.sync_k, &o.pulse_total_ms) != 2 || o.sync_k < 2 || o.sync_k > 30)
                     return usage();
@@ -439,6 +463,14 @@ int main(int argc, char **argv) {
         return std::fprintf(stderr, "camera %s: no characteristics\n", o.id.c_str()), 1;
     largest(chars, AIMAGE_FORMAT_RAW16, gS.raw_w, gS.raw_h);
     largest(chars, AIMAGE_FORMAT_YUV_420_888, gS.yuv_w, gS.yuv_h);
+    if (o.jpeg_orientation >= 0) {
+        // Like a camera app: preview-size YUV + same-size JPEG, no RAW.
+        gS.raw_w = gS.raw_h = 0;
+        if (gS.yuv_w > 1280) {
+            gS.yuv_w = 1280;
+            gS.yuv_h = 960;
+        }
+    }
     std::printf("camera %s: RAW16 %dx%d, YUV %dx%d\n", o.id.c_str(), gS.raw_w, gS.raw_h, gS.yuv_w, gS.yuv_h);
     if (!gS.yuv_w) return std::fprintf(stderr, "no YUV output\n"), 1;
 
@@ -458,6 +490,14 @@ int main(int argc, char **argv) {
         AImageReader_getWindow(raw_r, &raw_w);
     }
     AImageReader_new(gS.yuv_w, gS.yuv_h, AIMAGE_FORMAT_YUV_420_888, 4, &yuv_r);
+    AImageReader *jpg_r = nullptr;
+    ANativeWindow *jpg_w = nullptr;
+    AImageReader_ImageListener jpg_l{nullptr, on_jpeg};
+    if (o.jpeg_orientation >= 0) {
+        AImageReader_new(gS.yuv_w, gS.yuv_h, AIMAGE_FORMAT_JPEG, 2, &jpg_r);
+        AImageReader_setImageListener(jpg_r, &jpg_l);
+        AImageReader_getWindow(jpg_r, &jpg_w);
+    }
     AImageReader_setImageListener(yuv_r, &yuv_l);
     AImageReader_getWindow(yuv_r, &yuv_w);
 
@@ -470,6 +510,11 @@ int main(int argc, char **argv) {
     }
     ACaptureSessionOutput_create(yuv_w, &yuv_o);
     ACaptureSessionOutputContainer_add(outs, yuv_o);
+    ACaptureSessionOutput *jpg_o = nullptr;
+    if (jpg_w) {
+        ACaptureSessionOutput_create(jpg_w, &jpg_o);
+        ACaptureSessionOutputContainer_add(outs, jpg_o);
+    }
     ACameraCaptureSession_stateCallbacks scb{nullptr, sess_noop, sess_noop, sess_noop};
     ACameraCaptureSession *sess = nullptr;
     st = ACameraDevice_createCaptureSession(dev, outs, &scb, &sess);
@@ -481,6 +526,11 @@ int main(int argc, char **argv) {
     ACameraOutputTarget_create(yuv_w, &yuv_t);
 
     auto setup = [&](ACaptureRequest *rq) {
+        // IRIS_GRAB_EV=<steps>: auto exposure compensation (tests of the AE gain range).
+        if (const char *ev = getenv("IRIS_GRAB_EV")) {
+            int32_t v = std::atoi(ev);
+            ACaptureRequest_setEntry_i32(rq, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &v);
+        }
         uint8_t effect = o.colour ? ACAMERA_CONTROL_EFFECT_MODE_OFF : ACAMERA_CONTROL_EFFECT_MODE_MONO;
         ACaptureRequest_setEntry_u8(rq, ACAMERA_CONTROL_EFFECT_MODE, 1, &effect);
         if (o.exposure_us > 0 || o.iso > 0) {
@@ -505,6 +555,20 @@ int main(int argc, char **argv) {
     ACameraDevice_createCaptureRequest(dev, TEMPLATE_STILL_CAPTURE, &still);
     if (raw_t) ACaptureRequest_addTarget(still, raw_t);
     ACaptureRequest_addTarget(still, yuv_t);
+    if (jpg_w) {
+        ACameraOutputTarget *jpg_t = nullptr;
+        ACameraOutputTarget_create(jpg_w, &jpg_t);
+        ACaptureRequest_addTarget(still, jpg_t);
+        int32_t orient = o.jpeg_orientation;
+        ACaptureRequest_setEntry_i32(still, ACAMERA_JPEG_ORIENTATION, 1, &orient);
+        // IRIS_GRAB_NR=<0..4>: ANDROID_NOISE_REDUCTION_MODE for the still (0 = off).
+        if (const char *nr = getenv("IRIS_GRAB_NR")) {
+            uint8_t m = uint8_t(std::atoi(nr));
+            ACaptureRequest_setEntry_u8(still, ACAMERA_NOISE_REDUCTION_MODE, 1, &m);
+            uint8_t e = 0;  // edge off too when NR is off
+            if (m == 0) ACaptureRequest_setEntry_u8(still, ACAMERA_EDGE_MODE, 1, &e);
+        }
+    }
     setup(still);
 
     if (o.led_ma > 0 && o.pulse_total_ms == 0) {
@@ -630,6 +694,7 @@ int main(int argc, char **argv) {
             return gS.yuv_saved >= o.frames && (!raw_r || gS.raw_saved >= o.frames || gS.failed >= o.frames);
         });
     }
+    if (jpg_r) usleep(1500000);  // let the JPEG encoder finish
     led_off();
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     ACameraCaptureSession_abortCaptures(sess);
