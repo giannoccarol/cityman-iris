@@ -43,7 +43,7 @@ class IrisCapture {
     IrisCapture(IrLed* led, const iris_engine* engine, iris_context* engineContext);
     ~IrisCapture();
 
-    bool start(std::string* error);
+    bool start(int ledBudgetMs, std::string* error);
     void stop();
     void interrupt();
     bool firstFrameSeen() const { return mFirstFrame; }

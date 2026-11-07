@@ -182,14 +182,14 @@ int64_t IrLed::earliestOn(int64_t lengthNs) const {
 
 bool IrLed::budgetAvailable(int64_t lengthNs) const {
     std::lock_guard<std::mutex> lock(mLock);
-    return mOperationOnNs + lengthNs <= int64_t(kLedMaxOnPerOperationMs) * kMs &&
+    return mOperationOnNs + lengthNs <= mOperationLimitNs &&
            onTimeInWindowLocked(boottimeNs()) + lengthNs <= int64_t(kLedMaxOnPerWindowMs) * kMs;
 }
 
 bool IrLed::allowedLocked(int64_t onNs, int64_t offNs) const {
     const int64_t len = offNs - onNs;
     if (len <= 0 || len > int64_t(kLedMaxPulseMs) * kMs) return false;
-    if (mOperationOnNs + len > int64_t(kLedMaxOnPerOperationMs) * kMs) return false;
+    if (mOperationOnNs + len > mOperationLimitNs) return false;
     if (onTimeInWindowLocked(boottimeNs()) + len > int64_t(kLedMaxOnPerWindowMs) * kMs) {
         return false;
     }
@@ -202,9 +202,10 @@ bool IrLed::allowedLocked(int64_t onNs, int64_t offNs) const {
     return true;
 }
 
-void IrLed::beginOperation() {
+void IrLed::beginOperation(int maxOnMs) {
     std::lock_guard<std::mutex> lock(mLock);
     mOperationOnNs = 0;
+    mOperationLimitNs = int64_t(std::clamp(maxOnMs, 1000, kLedMaxOnPerWindowMs)) * kMs;
 }
 
 bool IrLed::schedule(int64_t onNs, int64_t offNs, int currentMa) {
@@ -303,7 +304,7 @@ std::string IrLed::toString() const {
     os << "IR LED " << android::base::Join(mPaths, " + ") << ": driver max (sum) " << mDriverMaxMa << " mA, hard cap "
        << kLedMaxCurrentMa << " mA, pulse <= " << kLedMaxPulseMs << " ms, duty <= "
        << kLedMaxDutyPermille / 10 << " %, lit " << mLit << ", pending " << mHasRequest
-       << ", operation on-time " << mOperationOnNs / kMs << " ms / " << kLedMaxOnPerOperationMs
+       << ", operation on-time " << mOperationOnNs / kMs << " ms / " << mOperationLimitNs / kMs
        << " ms, window on-time " << onTimeInWindowLocked(boottimeNs()) / kMs << " ms / "
        << kLedMaxOnPerWindowMs << " ms per " << kLedBudgetWindowMs / 1000 << " s\n";
     return os.str();

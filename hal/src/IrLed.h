@@ -29,7 +29,7 @@ struct LedPulse {
 // The caller schedules single pulses on absolute CLOCK_BOOTTIME times (one camera frame each, see
 // IrisPipeline). The private thread lights the LED only for scheduled pulses that pass every
 // limit: pulse <= kLedMaxPulseMs, duty cycle <= kLedMaxDutyPermille against the previous pulse,
-// <= kLedMaxOnPerOperationMs per operation, <= kLedMaxOnPerWindowMs per rolling window shared by
+// <= the per-operation limit set by beginOperation(), <= kLedMaxOnPerWindowMs per rolling window shared by
 // the whole process, current <= kLedMaxCurrentMa and the driver's max_brightness. The LED is
 // forced off on construction, cancel(), destruction and on any write error; init also writes 0
 // when the service stops or restarts (rc file).
@@ -41,8 +41,8 @@ class IrLed {
     IrLed& operator=(const IrLed&) = delete;
 
     bool usable() const;
-    // Resets the per-operation on-time counter.
-    void beginOperation();
+    // Resets the per-operation on-time counter and sets the lit-time budget for this operation.
+    void beginOperation(int maxOnMs);
     // Cancels any pending pulse and switches the LED off. Safe to call at any time.
     void cancel();
     // Schedules one pulse. Returns false (nothing scheduled) when the pulse would break a limit
@@ -92,6 +92,7 @@ class IrLed {
     uint64_t mGeneration = 0;  // bumped by cancel()
     bool mLit = false;
     int64_t mOperationOnNs = 0;
+    int64_t mOperationLimitNs = 8000LL * 1000000LL;  // enroll default; set by beginOperation()
     std::deque<LedPulse> mHistory;  // pulses of the last kLedBudgetWindowMs
 };
 

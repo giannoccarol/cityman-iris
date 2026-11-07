@@ -42,9 +42,10 @@ inline constexpr int kLedDefaultCurrentMa = 140;  // Windows lowest level (code 
 inline constexpr int kLedMaxPulseMs = 70;         // Windows assist pulse length
 inline constexpr int kLedMaxDutyPermille = 350;   // on / (on + following gap) <= 35 %
 inline constexpr int kLedMinGapMs = 50;           // absolute floor between two pulses
-inline constexpr int kLedMaxOnPerOperationMs = 4000;  // lit time per enroll/auth operation
+inline constexpr int kLedMaxOnPerOperationEnrollMs = 8000;  // lit time per enrollment operation
+inline constexpr int kLedMaxOnPerOperationAuthMs = 4000;    // lit time per authentication operation
 inline constexpr int kLedBudgetWindowMs = 60000;      // rolling window of the thermal budget
-inline constexpr int kLedMaxOnPerWindowMs = 8000;     // => <= 13 % average duty over a minute
+inline constexpr int kLedMaxOnPerWindowMs = 12000;    // => <= 20 % average duty over a minute
 
 // Frame-locked pulses (measured 6/11 on the phone, test kernel 6, iris_grab): the sysfs write
 // takes 0.37 ms on average (max 1.3 ms) and the light follows within ~1 ms, on CLOCK_BOOTTIME,
@@ -60,6 +61,10 @@ inline constexpr int64_t kDefaultFrameDurationNs = 33440000;
 // 23/23 pulses gave exactly one fully lit frame). The two frames next to the lit one are partly
 // lit and dropped; the frame two away from it is the dark (ambient) reference.
 inline constexpr int kLedFramePeriod = 4;
+
+// Preview default: the iris sensor reports ACAMERA_SENSOR_ORIENTATION 90 but the face comes out
+// upright, so the preview is not rotated. Override with persist.vendor.iris.preview_rotation.
+inline constexpr int kPreviewRotationDefault = 0;
 // Brightness cross-check: a frame counted as lit must be this much brighter (mean Y) than the
 // last unlit frame, or it is discarded (wrong timing model, LED fault).
 inline constexpr float kLitMinGain = 1.25f;

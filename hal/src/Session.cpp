@@ -520,7 +520,7 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
         mCapture = nullptr;
     };
     std::string error;
-    if (opCancelled(opId) || !capture.start(&error)) {
+    if (opCancelled(opId) || !capture.start(kLedMaxOnPerOperationEnrollMs, &error)) {
         if (!error.empty()) LOG(ERROR) << "enroll: " << error;
         capture.stop();
         finish();
@@ -535,10 +535,11 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
     // front camera.
     std::unique_ptr<PreviewSink> sink;
     if (preview) sink = std::make_unique<PreviewSink>(preview.get());
-    int rotation = ::android::base::GetIntProperty("persist.vendor.iris.preview_rotation", -1);
-    if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) {
-        rotation = capture.sensorOrientation();
-    }
+    // The iris sensor reports ACAMERA_SENSOR_ORIENTATION 90 but delivers the face already upright,
+    // so the preview is not rotated by default; override with persist.vendor.iris.preview_rotation.
+    int rotation = ::android::base::GetIntProperty("persist.vendor.iris.preview_rotation",
+                                                   kPreviewRotationDefault);
+    if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) rotation = 0;
     const bool mirror = ::android::base::GetBoolProperty("persist.vendor.iris.preview_mirror", true);
 
     std::vector<TemplatePtr> samples[2];
@@ -548,6 +549,7 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
     std::vector<Probe> probes;
     Error failure = Error::UNKNOWN;
     bool done = false;
+    bool sideStruggling[2] = {false, false};  // its samples are not yet mutually consistent
 
     while (!done) {
         const int64_t left = deadline - bootMs();
@@ -591,7 +593,9 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
             for (const auto& p : probes) {
                 PreviewEye& e = eyes[p.side & 1];
                 e.found = p.quality.eye_found != 0 && p.quality.iris_r > 0.f;
-                e.good = p.status == IRIS_OK;
+                // Amber while this eye's samples are not yet mutually consistent, even when the
+                // current frame is fine, so the user sees which eye still needs a steady look.
+                e.good = p.status == IRIS_OK && !sideStruggling[p.side & 1];
                 e.irisX = p.quality.iris_x;
                 e.irisY = p.quality.iris_y;
                 e.irisR = p.quality.iris_r;
@@ -623,7 +627,8 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
         iris_engine_get_config(mCtx->engine, &cfg);
         Enrollment e;
         e.id = enrollmentId;
-        for (auto& side : samples) {
+        for (size_t sidx = 0; sidx < 2; ++sidx) {
+            auto& side = samples[sidx];
             if (side.size() < cfg.enroll_min_samples) continue;
             std::vector<const iris_template*> ptrs;
             for (const auto& t : side) ptrs.push_back(t.get());
@@ -635,8 +640,35 @@ void Session::doEnroll(uint64_t opId, const keymaster::HardwareAuthToken& hat,
             if (st != IRIS_OK) {
                 LOG(INFO) << "enroll: side not consistent yet (" << iris_status_string(st)
                           << ", " << einfo.samples_used << "/" << einfo.samples_in << ")";
+                // Drop the single most inconsistent sample (highest mean distance to the others)
+                // instead of waiting for it to roll out, so one odd-but-valid frame does not block
+                // enrollment. The eye keeps its amber ring in the preview until it is consistent.
+                if (side.size() > size_t(cfg.enroll_min_samples)) {
+                    int worst = -1;
+                    float worstMean = -1.f;
+                    for (size_t i = 0; i < side.size(); ++i) {
+                        float sum = 0.f;
+                        int cnt = 0;
+                        for (size_t j = 0; j < side.size(); ++j) {
+                            if (i == j) continue;
+                            float sc = 1.f;
+                            if (iris_match(mCtx->engine, side[i].get(), side[j].get(), &sc) == IRIS_OK) {
+                                sum += sc;
+                                cnt++;
+                            }
+                        }
+                        const float mean = cnt ? sum / float(cnt) : 1.f;
+                        if (mean > worstMean) {
+                            worstMean = mean;
+                            worst = int(i);
+                        }
+                    }
+                    if (worst >= 0) side.erase(side.begin() + worst);
+                }
+                sideStruggling[sidx] = true;
                 continue;
             }
+            sideStruggling[sidx] = false;
             size_t size = 0;
             iris_template_serialize(tmpl.get(), nullptr, 0, &size);
             std::vector<uint8_t> buf(size);
@@ -762,7 +794,7 @@ void Session::doAuthenticate(uint64_t opId, int64_t operationId) {
         mCapture = nullptr;
     };
     std::string error;
-    if (opCancelled(opId) || !capture.start(&error)) {
+    if (opCancelled(opId) || !capture.start(kLedMaxOnPerOperationAuthMs, &error)) {
         if (!error.empty()) LOG(ERROR) << "authenticate: " << error;
         finish();
         mCb->onError(opCancelled(opId) ? Error::CANCELED : Error::HW_UNAVAILABLE, 0);

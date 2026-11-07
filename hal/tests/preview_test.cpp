@@ -38,10 +38,9 @@ std::vector<uint8_t> synthetic(const Eye eyes[2], uint32_t seed) {
                 const Eye& E = eyes[e];
                 const float ex = x - E.x, ey = y - E.y;
                 const float d = std::sqrt(ex * ex + ey * ey);
-                // Almond-shaped eye opening. Rotated 90 degrees, the display horizontal is the
-                // sensor y axis: the eye is wide along y.
-                const float lid = (ex * ex) / (1.25f * E.r * 1.25f * E.r) +
-                                  (ey * ey) / (2.3f * E.r * 2.3f * E.r);
+                // Almond-shaped eye opening, wide along x (face upright).
+                const float lid = (ex * ex) / (2.3f * E.r * 2.3f * E.r) +
+                                  (ey * ey) / (1.25f * E.r * 1.25f * E.r);
                 if (lid < 1.f) {
                     v = 175.f;  // sclera
                     if (d < E.r) {
@@ -95,14 +94,14 @@ int main(int argc, char** argv) {
     writePpm(outDir + "/preview_clear.ppm", rgba, S, S);
 
     // Eyes in sensor coordinates: same column, top and bottom halves (portrait use, mount 90).
-    Eye eyes[2] = {{1010, 330, 64, 23}, {990, 760, 62, 21}};
+    Eye eyes[2] = {{620, 520, 64, 23}, {1180, 500, 62, 21}};  // side by side, face upright
     const auto img = synthetic(eyes, 1);
     PreviewInput in;
     in.y = img.data();
     in.width = W;
     in.height = H;
     in.stride = W;
-    in.rotation = 90;
+    in.rotation = 0;
     in.mirror = true;
     auto setEyes = [&](float p0, float p1, bool good1) {
         for (int e = 0; e < 2; e++) {

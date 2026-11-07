@@ -56,7 +56,7 @@ IrisCapture::~IrisCapture() {
     stop();
 }
 
-bool IrisCapture::start(std::string* error) {
+bool IrisCapture::start(int ledBudgetMs, std::string* error) {
     int goodExp, goodIso, goodLed;
     {
         std::lock_guard<std::mutex> lock(gGoodLock);
@@ -76,7 +76,9 @@ bool IrisCapture::start(std::string* error) {
                                        kLedMaxMarginUs)) *
                 1000;
     mPeriod = GetIntProperty("persist.vendor.iris.period", kLedFramePeriod, 3, 8);
-    const std::string split = GetProperty("persist.vendor.iris.split", "rows");
+    // Default cols: the iris sensor delivers the face already upright with the two eyes side by
+    // side, so the left/right halves hold one eye each.
+    const std::string split = GetProperty("persist.vendor.iris.split", "cols");
     mSplit = split == "none" ? 0 : split == "cols" ? 2 : 1;
     mSubtract = GetBoolProperty("persist.vendor.iris.subtract", false);
     mDump = GetBoolProperty("persist.vendor.iris.dump", false);
@@ -94,7 +96,7 @@ bool IrisCapture::start(std::string* error) {
         *error = "IR LED unavailable";
         return false;
     }
-    mLed->beginOperation();
+    mLed->beginOperation(ledBudgetMs);
     if (!mCamera.open(mExposureUs, mIso, error)) return false;
     LOG(INFO) << "capture: exposure " << mExposureUs << " us, ISO " << mIso << ", LED "
               << mLedMa << " mA, one frame in " << mPeriod << ", margin " << mMarginNs / 1000
@@ -307,18 +309,27 @@ void IrisCapture::adapt(const std::vector<Probe>& probes, float meanY) {
     for (const auto& p : probes) {
         if (p.quality.eye_found && (!best || p.quality.overall > best->quality.overall)) best = &p;
     }
+    // Drive exposure only by whether the iris itself is usable, never by the frame's 99.5th
+    // percentile (quality.exposure): a nose or spectacle glint saturates that even when the iris
+    // is well exposed, and the old rule then dimmed the LED to nothing.
+    bool overexposed = false;  // the iris ring is saturated (engine measures it on the ring)
+    for (const auto& p : probes) {
+        if (p.status == IRIS_Q_OVEREXPOSED) overexposed = true;
+    }
     int dir = 0;
-    if (best) {
-        if (best->status == IRIS_Q_UNDEREXPOSED || best->quality.exposure < 0.30f) dir = 1;
-        if (best->status == IRIS_Q_OVEREXPOSED || best->quality.exposure > 0.97f) dir = -1;
-        if (best->status == IRIS_OK) rememberGoodSettings(mExposureUs, mIso, mLedMa);
+    if (best && best->status == IRIS_OK) {
+        // A validated eye: keep these settings; remember them only when the sample is decent, so a
+        // lucky marginal frame does not become the next operation's starting point.
+        if (best->quality.overall >= 50.f) rememberGoodSettings(mExposureUs, mIso, mLedMa);
+        return;
+    }
+    if (overexposed) {
+        dir = -1;  // iris saturated: less light
+    } else if (!best) {
+        dir = 1;   // no eye found at all: more light may bring it out (bounded by the LED limits)
+        if (meanY > 230.f) dir = -1;  // frame already washed out: back off instead
     } else {
-        for (const auto& p : probes) {
-            if (p.status == IRIS_Q_UNDEREXPOSED) dir = 1;
-            if (p.status == IRIS_Q_OVEREXPOSED) dir = -1;
-        }
-        if (dir == 0 && meanY < 20.f) dir = 1;
-        if (dir == 0 && meanY > 210.f) dir = -1;
+        return;  // eye found but rejected for a non-exposure reason (blur, occlusion): leave it
     }
     if (dir == 0) return;
     int exposure = mExposureUs;

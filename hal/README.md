@@ -59,16 +59,16 @@ stream starts instead of three. After that the cadence is K = 4 (duty <= 35 %).
 | total current | 200 mA (two channels, 100 mA each) | Windows used 140/200/290/300 mA levels |
 | pulse | <= 70 ms | Windows assist pulse length |
 | duty | <= 35 % per pulse | own choice (Windows cooldown model unknown) |
-| per operation | <= 4 s lit | own choice |
-| per minute | <= 8 s lit | own choice |
+| per operation | <= 8 s (enroll) / 4 s (auth) lit | own choice |
+| per minute | <= 12 s lit | own choice |
 
 The emitter is switched off on every error, cancel, close and service restart (rc file).
 
 ### Recognition
 
-Each lit frame is split in two overlapping halves (`persist.vendor.iris.split`, default `rows`:
-with the sensor mounted at 90 degrees the two eyes sit in the top and bottom halves of the sensor
-image) and the engine looks for one iris in each. Enrollment keeps up to 16 good samples per
+Each lit frame is split in two overlapping halves (`persist.vendor.iris.split`, default `cols`:
+the sensor delivers the face upright with the two eyes side by side) and the engine looks for one
+iris in each, searching each eye first around where it was in the previous lit frames. Enrollment keeps up to 16 good samples per
 eye and builds a template per eye once one eye has 6; authentication accepts the first probe
 that matches any stored eye, and counts one failure after 3 good non-matching frames or a
 timeout with good frames. Lockout: timed (30 s) every 5 failures, permanent after 20.
@@ -77,7 +77,8 @@ timeout with good frames. Lockout: timed (30 s) every 5 failures, permanent afte
 
 On Android 16 Settings passes a Surface in `FaceEnrollOptions.surfacePreview`; the HAL draws an
 IR preview into it (`Preview.cpp`, `PreviewSink.cpp`). Only lit frames are shown (about 7.5 per
-second): rotated by `ACAMERA_SENSOR_ORIENTATION` and mirrored like a front camera, a square crop
+second): not rotated by default (the sensor reports orientation 90 but delivers the face upright; override
+with `persist.vendor.iris.preview_rotation`) and mirrored like a front camera, a square crop
 that follows the eyes with exponential smoothing of centre and zoom, bilinear sampling (from a
 2x2 box-filtered half image when downscaling), percentile contrast stretch, gamma 0.85, a cold
 monochrome ramp (#0B1A2A shadows to #CDEFFF / near-white highlights) and a soft vignette. For each
@@ -98,12 +99,12 @@ of `enroll`/`enrollWithContext` is not supported.
 | `persist.vendor.iris.led_ma` | 140 | 25-200 (total) |
 | `persist.vendor.iris.led_margin_us` | 2000 | 0-8000 |
 | `persist.vendor.iris.period` | 4 | 3-8 frames |
-| `persist.vendor.iris.split` | `rows` | `rows`, `cols`, `none` |
+| `persist.vendor.iris.split` | `cols` | `rows`, `cols`, `none` (eyes side by side) |
 | `persist.vendor.iris.subtract` | false | ambient subtraction |
 | `persist.vendor.iris.min_radius` / `max_radius` | 40 / 130 px | engine geometry |
 | `persist.vendor.iris.threshold` | 0.36 | 0.20-0.40 |
 | `persist.vendor.iris.camera_id` | auto | force a camera id |
-| `persist.vendor.iris.preview_rotation` | sensor orientation | 0, 90, 180, 270 |
+| `persist.vendor.iris.preview_rotation` | 0 | 0, 90, 180, 270 (sensor delivers the face upright) |
 | `persist.vendor.iris.preview_mirror` | true | mirror the preview like a front camera |
 | `persist.vendor.iris.dump` | false | save up to 64 lit frames to `/data/vendor/iris/dump` (biometric data!) |
 
