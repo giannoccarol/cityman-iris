@@ -393,9 +393,11 @@ ndk::ScopedAStatus Session::getFeatures() {
         }
         const UserState state = store.loadState();
         std::vector<Feature> features;
-        for (Feature f : {Feature::REQUIRE_ATTENTION, Feature::REQUIRE_DIVERSE_POSES,
-                          Feature::DEBUG}) {
-            if (state.features & (1u << static_cast<int>(f))) features.push_back(f);
+        // Report REQUIRE_ATTENTION only. The Android 16 framework (FaceGetFeatureClient) sizes its
+        // reply for that one feature and indexes past the end, crashing system_server, when the
+        // HAL also returns REQUIRE_DIVERSE_POSES (which Settings passes at enrollment) or DEBUG.
+        if (state.features & (1u << static_cast<int>(Feature::REQUIRE_ATTENTION))) {
+            features.push_back(Feature::REQUIRE_ATTENTION);
         }
         mCb->onFeaturesRetrieved(features);
     });
