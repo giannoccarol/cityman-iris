@@ -429,7 +429,7 @@ std::vector<Cand> pupil_candidates(const ImageU8 &c, int f, float rmin_full, flo
                 break;
             }
         if (!dup) kept.push_back(cd);
-        if (kept.size() >= 4) break;
+        if (kept.size() >= 6) break;
     }
     return kept;
 }
@@ -716,6 +716,30 @@ Parabola fit_lid(const CropCtx &cc, const Contour &pupil, const LimbusFit &lf, b
 
 namespace {
 
+// Robust spread (MAD) of the iris ring at mid radius over the lateral sectors, on the lightly
+// blurred image: high for a textured iris, low for smooth skin or hair. Ranks candidates.
+float ring_texture(const CropCtx &cc, const Contour &pupil, const LimbusFit &lf) {
+    const float rmid = 0.5f * (pupil.a0 + lf.r);
+    if (rmid <= 1.f) return 0.f;
+    std::vector<float> v;
+    v.reserve(96);
+    for (int sector = 0; sector < 2; ++sector) {
+        const float base = sector == 0 ? -40.f : 140.f;  // right and left arcs (y grows down)
+        for (int a = 0; a < 48; ++a) {
+            const float t = (base + 80.f * (float(a) + 0.5f) / 48.f) * kPi / 180.f;
+            const float x = lf.cx + rmid * std::cos(t), y = lf.cy + rmid * std::sin(t);
+            if (cc.in_glint(x, y)) continue;
+            bool ok;
+            float s = bilinear(cc.s1, x, y, &ok);
+            if (ok) v.push_back(s);
+        }
+    }
+    if (v.size() < 16) return 0.f;
+    float med = median_of(v);
+    for (auto &x : v) x = std::fabs(x - med);
+    return 1.4826f * median_of(v);
+}
+
 template <typename T>
 void reset_image(Image<T> &img, int w, int h, T v) {
     img.w = w, img.h = h;
@@ -724,8 +748,8 @@ void reset_image(Image<T> &img, int w, int h, T v) {
 
 }  // namespace
 
-bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation &seg, int &crop_x,
-             int &crop_y, iris_status &st, ExtractDebug *dbg) {
+size_t segment(const iris_engine &eng, Scratch &sc, const Hint *hint, iris_status &st,
+               ExtractDebug *dbg) {
     const iris_config &cfg = eng.cfg;
     const InputMap &m = sc.map;
     const float rmin_iris = cfg.min_iris_radius, rmax_iris = cfg.max_iris_radius;
@@ -744,15 +768,14 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
         return cs;
     };
 
-    bool have = false;
-    iris_status fail = IRIS_Q_NO_EYE, best_st = IRIS_OK;
-    float best_total = -1.f;
-    // Full-resolution fits of the best candidates; keeps the best segmentation in sc.best.
+    iris_status fail = IRIS_Q_NO_EYE;
+    sc.ncands = 0;
+    // Full-resolution fits: append every candidate that passes the geometry gates to sc.cands
+    // (recycling buffers), ranked later by (tier, score). extract() applies the texture and
+    // occlusion gates to them in order and keeps the first usable one.
     auto fit_candidates = [&](const std::vector<Cand> &cands) {
-        have = false;
+        sc.ncands = 0;
         fail = IRIS_Q_NO_EYE;
-        best_st = IRIS_OK;
-        best_total = -1.f;
         if (dbg) {
             dbg->cand_x.clear(), dbg->cand_y.clear(), dbg->cand_r.clear(), dbg->cand_score.clear();
             for (const Cand &c : cands) {
@@ -762,12 +785,20 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
                 dbg->cand_score.push_back(c.score);
             }
         }
-        const size_t ntry = std::min<size_t>(3, cands.size());
+        const size_t ntry = std::min<size_t>(6, cands.size());
         for (size_t ci = 0; ci < ntry; ++ci) {
             const Cand &cd = cands[ci];
-            if (ci > 0 && cd.score < 0.25f * cands[0].score) break;
-            // another hypothesis inside an eye already segmented: same eye, skip
-            if (have && std::hypot(cd.x - float(crop_x) - seg.iris.cx, cd.y - float(crop_y) - seg.iris.cy) < seg.iris.a0) continue;
+            if (ci > 0 && cd.score < 0.08f * cands[0].score) break;  // the real eye may score low
+            // skip a candidate that falls inside an eye already fitted at the passing tier
+            bool inside = false;
+            for (size_t k = 0; k < sc.ncands && !inside; ++k) {
+                const CandResult &r = sc.cands[k];
+                if (r.tier == 1 &&
+                    std::hypot(cd.x - float(r.crop_x) - r.seg.iris.cx,
+                               cd.y - float(r.crop_y) - r.seg.iris.cy) < r.seg.iris.a0)
+                    inside = true;
+            }
+            if (inside) continue;
             const float half = std::min(rmax_iris * 1.15f, std::max(cd.r / 0.12f, rmin_iris)) + 10.f;
             const int x0 = std::max(0, int(cd.x - half)), y0 = std::max(0, int(cd.y - half));
             const int x1 = std::min(m.w, int(cd.x + half) + 1), y1 = std::min(m.h, int(cd.y + half) + 1);
@@ -802,15 +833,19 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
             if (lf.contrast < cfg.min_limbus_contrast) continue;
             const float ratio = rpm / lf.r;
             const float offc = std::hypot(lf.cx - pf.c.cx, lf.cy - pf.c.cy);
-            if (ratio < 0.1f || ratio > 0.85f || offc + rpx > lf.r - 1.f || lf.r >= r_hi - 0.5f) {
+            if (ratio < std::max(0.1f, cfg.min_pupil_iris_ratio) || ratio > 0.85f ||
+                offc + rpx > lf.r - 1.f || lf.r >= r_hi - 0.5f) {
                 if (fail == IRIS_Q_NO_IRIS) fail = IRIS_Q_BAD_GEOMETRY;
                 continue;
             }
-            const float total = cd.score * std::min(1.f, lf.contrast / 10.f) * pf.valid_frac;
-            if (total <= best_total) continue;
-            best_total = total;
-            have = true;
-            best_st = IRIS_OK;
+            const float tex = ring_texture(cc, pf.c, lf);
+            const float total = cd.score * std::min(1.f, lf.contrast / 10.f) * pf.valid_frac *
+                                std::min(1.f, tex / 6.f);  // ~6 grey levels of texture = full weight
+            // Tier: a candidate whose iris is below the minimum radius would be rejected by
+            // extract() (IRIS_Q_IRIS_TOO_SMALL). It ranks below any candidate that passes that
+            // gate, so a small dark distractor (hair, nostril) never hides the real eye.
+            const int tier = lf.r >= rmin_iris ? 1 : 0;
+            iris_status sub_st = IRIS_OK;
 
             Segmentation s;
             s.pupil = pf.c;
@@ -883,14 +918,25 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
                     }
                 }
             for (size_t i = 0; i < mask.px.size(); ++i) mask.px[i] |= cc.glint.px[i];
-            if (nring > 0 && float(nsat) > 0.2f * float(nring)) best_st = IRIS_Q_OVEREXPOSED;
+            if (nring > 0 && float(nsat) > 0.2f * float(nring)) sub_st = IRIS_Q_OVEREXPOSED;
 
-            seg = s;
-            crop_x = x0, crop_y = y0;
-            std::swap(sc.cur, sc.best);
-            std::swap(sc.mask, sc.best_mask);
+            // Append, recycling the slot's buffers.
+            if (sc.ncands >= sc.cands.size()) sc.cands.emplace_back();
+            CandResult &r = sc.cands[sc.ncands++];
+            r.seg = s;
+            r.crop_x = x0, r.crop_y = y0;
+            r.tier = tier;
+            r.total = total;
+            r.sub_st = sub_st;
+            std::swap(r.crop, cc.raw);
+            std::swap(r.mask, sc.mask);
         }
-        return have;
+        // Best first: passing tier, then score.
+        std::sort(sc.cands.begin(), sc.cands.begin() + long(sc.ncands),
+                  [](const CandResult &a, const CandResult &b) {
+                      return a.tier != b.tier ? a.tier > b.tier : a.total > b.total;
+                  });
+        return sc.ncands > 0;
     };
 
     // 1. Around the hint (the eye position in the previous frame), when given.
@@ -901,9 +947,11 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
         const int x1 = std::min(m.w, int(hx + hw) + 1), y1 = std::min(m.h, int(hy + hw) + 1);
         if (x1 > x0 && y1 > y0) {
             std::vector<Cand> cands = find(x0, y0, x1 - x0, y1 - y0);
-            if (!cands.empty() && fit_candidates(cands)) {
-                st = best_st;
-                return true;
+            // Only accept the hint window when it yields a tier-1 (full-size) eye; otherwise fall
+            // through to the whole-frame search.
+            if (!cands.empty() && fit_candidates(cands) && sc.cands[0].tier == 1) {
+                st = IRIS_OK;
+                return sc.ncands;
             }
         }
     }
@@ -911,12 +959,13 @@ bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation
     std::vector<Cand> cands = find(0, 0, m.w, m.h);
     if (cands.empty()) {
         if (dbg) dbg->cand_x.clear(), dbg->cand_y.clear(), dbg->cand_r.clear(), dbg->cand_score.clear();
+        sc.ncands = 0;
         st = IRIS_Q_NO_EYE;
-        return false;
+        return 0;
     }
     fit_candidates(cands);
-    st = have ? best_st : fail;
-    return have;
+    st = sc.ncands ? IRIS_OK : fail;
+    return sc.ncands;
 }
 
 }  // namespace citymaniris

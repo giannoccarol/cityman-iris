@@ -124,6 +124,12 @@ typedef struct iris_config {
     uint16_t enroll_min_samples;   /* 3 */
     uint16_t enroll_max_codes;     /* 5 */
     float enroll_consistency;      /* 0.32: max score of a sample against the medoid */
+
+    /* Candidate acceptance (since API 2). A real eye under the IR LED has a substantial dark
+       pupil inside the iris; a tiny dark speck (hair, nostril) with a large textured "iris"
+       around it does not. min_pupil_iris_ratio rejects candidates whose pupil is too small a
+       fraction of the iris, the main cause of hair/skin false positives on close IR frames. */
+    float min_pupil_iris_ratio;    /* 0.18 */
 } iris_config;
 
 /* Measured capture quality, filled by iris_extract*() even when the image is rejected. */

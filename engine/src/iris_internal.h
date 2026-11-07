@@ -157,6 +157,18 @@ struct CropCtx {
     }
 };
 
+// One eye candidate that passed the geometry fits, with its own crop and noise mask. extract()
+// runs the texture/occlusion gates on these in ranked order and keeps the first that is usable.
+struct CandResult {
+    Segmentation seg;
+    int crop_x = 0, crop_y = 0;
+    ImageF crop;   // raw crop (owns its buffer; recycled across calls)
+    ImageU8 mask;  // noise mask
+    int tier = 0;  // 1 = iris >= min radius
+    float total = 0;
+    iris_status sub_st = IRIS_OK;  // IRIS_Q_OVEREXPOSED when the iris ring is saturated
+};
+
 // Everything extract() would otherwise allocate per call. One per thread (iris_context).
 struct Scratch {
     InputMap map;
@@ -170,9 +182,12 @@ struct Scratch {
     std::vector<Comp> comps;
     std::vector<int> comp_of, next_run;
     std::vector<int32_t> stack;
-    // crops (current candidate and best so far, swapped)
-    CropCtx cur, best;
-    ImageU8 raw_g, mask, best_mask, ring;
+    // crops (current candidate being fitted)
+    CropCtx cur;
+    ImageU8 raw_g, mask, ring;
+    // ranked eye candidates (buffers recycled)
+    std::vector<CandResult> cands;
+    size_t ncands = 0;
     ImageF blur_tmp;
     std::vector<float> kernel, col, vals;
     // rubber sheet and encoder
@@ -244,9 +259,10 @@ iris_status extract(const iris_engine &eng, const iris_image &img, iris_template
                     iris_quality *q, ExtractDebug *dbg);
 iris_status extract(const iris_engine &eng, Scratch &sc, const iris_image &img, const Hint *hint,
                     iris_template **out, iris_quality *q, ExtractDebug *dbg);
-// On success the crop is sc.best.raw and the noise mask sc.best_mask (crop coordinates).
-bool segment(const iris_engine &eng, Scratch &sc, const Hint *hint, Segmentation &seg, int &crop_x,
-             int &crop_y, iris_status &st, ExtractDebug *dbg);
+// Fills sc.cands[0..return) with ranked eye candidates (best first). Returns the count; `st` is
+// the rejection status to report when it returns 0.
+size_t segment(const iris_engine &eng, Scratch &sc, const Hint *hint, iris_status &st,
+               ExtractDebug *dbg);
 void normalize_iris(const iris_engine &eng, const Segmentation &seg, const ImageF &crop,
                     const ImageU8 &noise_mask, ImageF &norm, ImageU8 &valid);
 void encode(const iris_engine &eng, const ImageF &norm, const ImageU8 &valid, Code &code);

@@ -289,6 +289,24 @@ questa macchina: l'unica verifica è la compilazione clang con `-fno-exceptions 
 Va moltiplicata per il numero di shift e di codici confrontati (21 × 5). Il dato vero sarà quello
 delle catture reali.
 
+## Robustezza ai falsi positivi (7/11/2026)
+
+Su fotogrammi IR ravvicinati reali `segment()` raccoglie più candidati pupilla (fino a 6, non più
+solo il migliore) e `extract()` applica a ciascuno, in ordine di punteggio, tutte le soglie di
+qualità (dimensione, fuori quadro, fuoco, occlusione, texture), restituendo il candidato valido
+con la qualità più alta; se nessuno passa, riporta lo stato del candidato arrivato più lontano
+(nessun template). Un nuovo campo di configurazione `min_pupil_iris_ratio` (0.18) scarta i
+candidati con una pupilla troppo piccola rispetto all'iride: è la causa principale dei falsi
+positivi su capelli/pelle in primo piano (una macchiolina scura con una grande "iride" texturata
+intorno). `tests/eye_frame.h` + `test_distractor` verificano che una macchia scura al bordo non
+venga scelta al posto dell'occhio e che un fotogramma con sole macchie scure venga respinto.
+
+Limite noto: in un primo piano estremo, su una metà di fotogramma con un grande sfondo scuro
+(capelli) e una pupilla riempita dal riflesso del LED, la ricerca a soglia globale può non isolare
+quella pupilla al primo fotogramma (restituisce un rifiuto pulito, non un falso positivo); con la
+posizione suggerita del fotogramma precedente (`iris_extract_ex` + hint) l'occhio viene poi
+ritrovato e tracciato.
+
 ## Velocità (API 2, 7/11/2026)
 
 Misure sull'host (Core Ultra 7 155H, core P, clang -O2, 1 thread) su un occhio sintetico

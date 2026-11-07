@@ -518,6 +518,48 @@ std::vector<uint8_t> serialized(const iris_template *t) {
     return b;
 }
 
+// A dark distractor blob (hair/nostril) near the border must not be returned instead of the real
+// eye, and a frame with only such a blob (no eye) must be rejected, not matched.
+void paint_dark_blob(std::vector<uint8_t> &img, int w, int cx, int cy, int r) {
+    const int h = int(img.size()) / w;
+    for (int y = std::max(0, cy - r); y <= std::min(h - 1, cy + r); ++y)
+        for (int x = std::max(0, cx - r); x <= std::min(w - 1, cx + r); ++x) {
+            float d = std::hypot(float(x) - float(cx), float(y) - float(cy));
+            if (d < float(r)) img[size_t(y) * w + x] = uint8_t(8.f + 6.f * (d / float(r)));  // dark speck
+        }
+}
+
+void test_distractor(const iris_engine *e) {
+    eyeframe::Params p;  // eye at (900, 520), iris r 85
+    auto frame = eyeframe::render(p);
+    // Dark specks in the corners, like hair or a nostril in a close IR frame.
+    paint_dark_blob(frame, p.width, 120, 140, 10);
+    paint_dark_blob(frame, p.width, 1800, 980, 9);
+    iris_template *t = nullptr;
+    iris_quality q{};
+    q.struct_size = sizeof(q);
+    iris_status st = iris_extract(e, frame.data(), p.width, p.height, 0, &t, &q);
+    std::printf("  distractor frame: %s, iris (%.0f, %.0f) r %.0f\n", iris_status_string(st),
+                double(q.iris_x), double(q.iris_y), double(q.iris_r));
+    CHECK(st == IRIS_OK);
+    CHECK(std::hypot(q.iris_x - p.cx, q.iris_y - p.cy) < 3.f);  // the real eye, not a corner blob
+    iris_template_destroy(t);
+
+    // Only the dark specks, no eye: must be rejected (no false-positive template).
+    std::vector<uint8_t> blank(size_t(p.width) * p.height);
+    std::mt19937 rng(3);
+    std::normal_distribution<float> sky(150.f, 6.f);
+    for (auto &v : blank) v = uint8_t(std::clamp(sky(rng), 0.f, 255.f));
+    paint_dark_blob(blank, p.width, 300, 300, 10);
+    paint_dark_blob(blank, p.width, 1600, 800, 12);
+    paint_dark_blob(blank, p.width, 900, 500, 8);
+    t = nullptr;
+    st = iris_extract(e, blank.data(), p.width, p.height, 0, &t, nullptr);
+    std::printf("  dark-specks-only frame: %s\n", iris_status_string(st));
+    CHECK(st != IRIS_OK);
+    CHECK(t == nullptr);
+}
+
 void test_context_hint(const iris_engine *e) {
     CHECK(iris_engine_api_version() >= 2);
     iris_context *ctx = nullptr;
@@ -612,6 +654,7 @@ int main() {
     test_serialization(e);
     test_enroll(e);
     test_threads(e);
+    test_distractor(e);
     test_context_hint(e);
     bench(e);
     iris_engine_destroy(e);

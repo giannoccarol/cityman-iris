@@ -41,6 +41,7 @@ bool config_valid(const iris_config &c) {
     if (!(c.min_overlap_fraction >= 0.f && c.min_overlap_fraction < 1.f)) return false;
     if (std::isnan(c.reference_bits) || !(c.match_threshold >= 0.f && c.match_threshold <= 1.f)) return false;
     if (c.enroll_min_samples < 1 || c.enroll_max_codes < 1 || c.enroll_max_codes > 64) return false;
+    if (!(c.min_pupil_iris_ratio >= 0.f && c.min_pupil_iris_ratio < 0.85f)) return false;
     return true;
 }
 
@@ -114,87 +115,132 @@ iris_status extract(const iris_engine &eng, Scratch &sc, const iris_image &img, 
         return IRIS_Q_IMAGE_TOO_SMALL;
     if (m.exposure < 0.04f) return IRIS_Q_UNDEREXPOSED;
 
-    Segmentation seg;
-    int cx = 0, cy = 0;
-    iris_status st = IRIS_OK;
-    bool found = segment(eng, sc, hint, seg, cx, cy, st, dbg);
-    if (dbg) {
-        dbg->seg = seg;
-        dbg->crop_x = cx, dbg->crop_y = cy;
-    }
-    if (!found) return st;
-    const ImageF &crop = sc.best.raw;
-    const ImageU8 &nmask = sc.best_mask;
-    if (q) fill_quality_geometry(q, seg, cx + m.x0, cy + m.y0);
-    if (st != IRIS_OK) return st;
-    if (seg.iris.a0 < cfg.min_iris_radius) return IRIS_Q_IRIS_TOO_SMALL;
+    iris_status fail = IRIS_OK;
+    size_t n = segment(eng, sc, hint, fail, dbg);
+    if (n == 0) return fail;
 
-    // Iris circle outside the image (crop is clamped to the image/ROI).
-    {
-        int outside = 0;
-        for (int i = 0; i < 64; ++i) {
-            float t = float(i) * 6.2831853f / 64.f;
-            float x = seg.iris.cx + seg.iris.a0 * std::cos(t), y = seg.iris.cy + seg.iris.a0 * std::sin(t);
-            int gx = int(x) + cx, gy = int(y) + cy;
-            if (gx < 0 || gy < 0 || gx >= m.w || gy >= m.h) outside++;
+    // Evaluate the candidates (best-ranked first) and keep the one with the highest quality that
+    // passes every gate. When none passes, report the status and geometry of the candidate that
+    // got furthest (richest feedback). A very good candidate stops the search early.
+    iris_quality best_q{};
+    best_q.struct_size = sizeof(best_q);
+    iris_status best_st = IRIS_Q_NO_EYE;
+    float best_overall = -1.f;       // best accepted quality so far (< 0: none yet)
+    float best_rej_overall = -1.f;   // best rejected fallback
+    iris_template *accepted = nullptr;
+
+    for (size_t ci = 0; ci < n; ++ci) {
+        const CandResult &r = sc.cands[ci];
+        const Segmentation &seg = r.seg;
+        const int cx = r.crop_x, cy = r.crop_y;
+        iris_quality cq{};
+        cq.struct_size = sizeof(cq);
+        cq.exposure = m.exposure;
+        fill_quality_geometry(&cq, seg, cx + m.x0, cy + m.y0);
+
+        iris_status st = r.sub_st;  // IRIS_Q_OVEREXPOSED or OK
+        iris_template *t = nullptr;
+        if (st == IRIS_OK) {
+            if (seg.iris.a0 < cfg.min_iris_radius) st = IRIS_Q_IRIS_TOO_SMALL;
         }
-        if (outside > 16) return IRIS_Q_OUT_OF_FRAME;
-    }
-    // Focus: blur relative to the shortest encoded wavelength at mid-iris.
-    float lambda_px = 1e9f;
-    for (int i = 0; i < cfg.n_filters; ++i) {
-        const float rmid = 0.5f * (seg.pupil.a0 + seg.iris.a0);
-        lambda_px = std::min(lambda_px, 6.2831853f * rmid * cfg.wavelength[i] / float(cfg.norm_cols));
-    }
-    const float blur = seg.blur_sigma < 0.f ? 0.f : seg.blur_sigma;
-    const float ratio = blur / lambda_px;
-    const float focus = 100.f / (1.f + (ratio / cfg.max_blur_ratio) * (ratio / cfg.max_blur_ratio));
-    if (q) q->focus = focus;
-    if (ratio > cfg.max_blur_ratio) return IRIS_Q_BLURRED;
-
-    ImageF &norm = sc.norm;
-    ImageU8 &valid = sc.valid;
-    normalize_iris(eng, seg, crop, nmask, norm, valid);
-    // eyelid coverage on the rubber sheet (geometry only)
-    {
-        int lid = 0;
-        const int R = cfg.norm_rows, C = cfg.norm_cols;
-        for (int j = 0; j < C; j += 2) {
-            const float t = 6.2831853f * float(j) / float(C), ct = std::cos(t), st2 = std::sin(t);
-            const float rp = seg.pupil.radius(t);
-            for (int i = 0; i < R; i += 2) {
-                const float rho = (float(i) + 0.5f) / float(R);
-                const float px = seg.pupil.cx + rp * ct, py = seg.pupil.cy + rp * st2;
-                const float x = px + rho * (seg.iris.cx + seg.iris.a0 * ct - px);
-                const float y = py + rho * (seg.iris.cy + seg.iris.a0 * st2 - py);
-                if ((seg.upper.present && y < seg.upper.y(x)) || (seg.lower.present && y > seg.lower.y(x))) lid++;
+        if (st == IRIS_OK) {
+            int outside = 0;
+            for (int i = 0; i < 64; ++i) {
+                float a = float(i) * 6.2831853f / 64.f;
+                float x = seg.iris.cx + seg.iris.a0 * std::cos(a), y = seg.iris.cy + seg.iris.a0 * std::sin(a);
+                int gx = int(x) + cx, gy = int(y) + cy;
+                if (gx < 0 || gy < 0 || gx >= m.w || gy >= m.h) outside++;
+            }
+            if (outside > 16) st = IRIS_Q_OUT_OF_FRAME;
+        }
+        float focus = 0.f;
+        if (st == IRIS_OK) {
+            float lambda_px = 1e9f;
+            for (int i = 0; i < cfg.n_filters; ++i) {
+                const float rmid = 0.5f * (seg.pupil.a0 + seg.iris.a0);
+                lambda_px = std::min(lambda_px, 6.2831853f * rmid * cfg.wavelength[i] / float(cfg.norm_cols));
+            }
+            const float blur = seg.blur_sigma < 0.f ? 0.f : seg.blur_sigma;
+            const float ratio = blur / lambda_px;
+            focus = 100.f / (1.f + (ratio / cfg.max_blur_ratio) * (ratio / cfg.max_blur_ratio));
+            cq.focus = focus;
+            if (ratio > cfg.max_blur_ratio) st = IRIS_Q_BLURRED;
+        }
+        float cand_overall = 0.f;
+        if (st == IRIS_OK) {
+            ImageF &norm = sc.norm;
+            ImageU8 &valid = sc.valid;
+            normalize_iris(eng, seg, r.crop, r.mask, norm, valid);
+            {
+                int lid = 0;
+                const int R = cfg.norm_rows, C = cfg.norm_cols;
+                for (int j = 0; j < C; j += 2) {
+                    const float t2 = 6.2831853f * float(j) / float(C), ct = std::cos(t2), st2 = std::sin(t2);
+                    const float rp = seg.pupil.radius(t2);
+                    for (int i = 0; i < R; i += 2) {
+                        const float rho = (float(i) + 0.5f) / float(R);
+                        const float px = seg.pupil.cx + rp * ct, py = seg.pupil.cy + rp * st2;
+                        const float x = px + rho * (seg.iris.cx + seg.iris.a0 * ct - px);
+                        const float y = py + rho * (seg.iris.cy + seg.iris.a0 * st2 - py);
+                        if ((seg.upper.present && y < seg.upper.y(x)) || (seg.lower.present && y > seg.lower.y(x))) lid++;
+                    }
+                }
+                cq.eyelid_coverage = float(lid) / float((R / 2) * (C / 2));
+            }
+            Code code;
+            encode(eng, norm, valid, code, sc.enc);
+            const float usable = float(code.valid_bits) / float(eng.layout.bits_total());
+            const float usable_geo = usable / std::max(0.1f, 1.f - cfg.fragile_fraction);
+            size_t nvalid_px = 0;
+            for (uint8_t v : valid.px) nvalid_px += v;
+            const float geo = float(nvalid_px) / float(std::max<size_t>(1, valid.px.size()));
+            cq.usable_fraction = usable;
+            if (geo < cfg.min_usable_fraction) st = IRIS_Q_OCCLUDED;
+            else if (usable_geo < cfg.min_usable_fraction) st = IRIS_Q_LOW_TEXTURE;
+            if (st == IRIS_OK) {
+                const float size_term = std::min(1.f, seg.iris.a0 / (1.5f * cfg.min_iris_radius));
+                cand_overall = focus * std::min(1.f, usable_geo / 0.8f) * (0.5f + 0.5f * size_term);
+                cq.overall = cand_overall;
+                t = new iris_template;
+                t->layout = eng.layout;
+                t->flags = cfg.fragile_fraction > 0.f ? 1u : 0u;
+                t->codes.push_back(std::move(code));
             }
         }
-        if (q) q->eyelid_coverage = float(lid) / float((R / 2) * (C / 2));
+        cq.status = st;
+        if (st == IRIS_OK) {  // accepted
+            if (cand_overall > best_overall) {
+                best_overall = cand_overall;
+                delete accepted;
+                accepted = t;
+                if (q) *q = cq;
+                if (dbg) {
+                    dbg->seg = seg;
+                    dbg->crop_x = cx, dbg->crop_y = cy;
+                    dbg->norm = sc.norm, dbg->norm_valid = sc.valid;
+                }
+            } else {
+                delete t;
+            }
+            // A clearly good eye: stop (the common case is the first candidate).
+            if (best_overall >= 85.f) break;
+        } else if (best_overall < 0.f && cand_overall > best_rej_overall) {
+            // No eye accepted yet: remember the candidate that got furthest, for the feedback.
+            best_rej_overall = cand_overall;
+            best_st = st;
+            best_q = cq;
+            if (dbg && ci == 0) {
+                dbg->seg = seg;
+                dbg->crop_x = cx, dbg->crop_y = cy;
+            }
+        }
     }
-    Code code;
-    encode(eng, norm, valid, code, sc.enc);
-    if (dbg) dbg->norm = norm, dbg->norm_valid = valid;
-    const float usable = float(code.valid_bits) / float(eng.layout.bits_total());
-    // The fragile-bit mask removes a fixed share of the bits; compare what is left with the
-    // geometric validity to tell occlusion from missing texture.
-    const float usable_geo = usable / std::max(0.1f, 1.f - cfg.fragile_fraction);
-    size_t nvalid_px = 0;
-    for (uint8_t v : valid.px) nvalid_px += v;
-    const float geo = float(nvalid_px) / float(std::max<size_t>(1, valid.px.size()));
-    if (q) q->usable_fraction = usable;
-    if (geo < cfg.min_usable_fraction) return IRIS_Q_OCCLUDED;
-    if (usable_geo < cfg.min_usable_fraction) return IRIS_Q_LOW_TEXTURE;
-
-    const float size_term = std::min(1.f, seg.iris.a0 / (1.5f * cfg.min_iris_radius));
-    code.quality = focus * std::min(1.f, usable_geo / 0.8f) * (0.5f + 0.5f * size_term);
-    if (q) q->overall = code.quality;
-    iris_template *t = new iris_template;
-    t->layout = eng.layout;
-    t->flags = cfg.fragile_fraction > 0.f ? 1u : 0u;
-    t->codes.push_back(std::move(code));
-    *out = t;
-    return IRIS_OK;
+    if (accepted) {
+        *out = accepted;
+        return IRIS_OK;
+    }
+    if (q) *q = best_q;
+    return best_st;
 }
 
 }  // namespace citymaniris
@@ -256,6 +302,7 @@ void iris_config_default(iris_config *c) {
     c->enroll_min_samples = 3;
     c->enroll_max_codes = 5;
     c->enroll_consistency = 0.32f;
+    c->min_pupil_iris_ratio = 0.18f;
 }
 
 iris_status iris_engine_create(const iris_config *config, iris_engine **engine_out) {
