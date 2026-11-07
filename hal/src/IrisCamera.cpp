@@ -5,6 +5,7 @@
 #define LOG_TAG "cityman.iris.camera"
 
 #include "IrisCamera.h"
+#include "IrLed.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -135,6 +136,14 @@ bool IrisCamera::open(int exposureUs, int iso, std::string* error) {
             e.count) {
             mSensorOrientation = e.data.i32[0];
         }
+        bool realtime = false;
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE, &e) ==
+                    ACAMERA_OK &&
+            e.count) {
+            realtime = e.data.u8[0] == ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+        }
+        setCameraClockRealtime(realtime);
+        LOG(INFO) << "camera timestamps on " << (realtime ? "CLOCK_BOOTTIME" : "CLOCK_MONOTONIC");
         ACameraMetadata_free(chars);
     }
     camera_status_t rc =

@@ -95,6 +95,8 @@ class IrLed {
     std::deque<LedPulse> mHistory;  // pulses of the last kLedBudgetWindowMs
 };
 
+// Now on the clock of the camera timestamps (CLOCK_MONOTONIC unless the camera reports REALTIME).
 int64_t boottimeNs();
+void setCameraClockRealtime(bool realtime);
 
 }  // namespace cityman::iris

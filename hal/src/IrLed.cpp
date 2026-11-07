@@ -6,6 +6,7 @@
 
 #include "IrLed.h"
 
+#include <atomic>
 #include <fcntl.h>
 #include <sched.h>
 #include <time.h>
@@ -28,13 +29,23 @@ namespace cityman::iris {
 
 namespace {
 constexpr int64_t kMs = 1000000LL;
-// The condition variable sleeps on CLOCK_MONOTONIC: wake this early, then spin on BOOTTIME.
+// The condition variable sleeps on CLOCK_MONOTONIC: wake this early, then spin on the camera clock.
 constexpr int64_t kSpinNs = 600000;
 }  // namespace
 
+// Clock of the camera timestamps: the pulses are planned against frame timestamps, so both must
+// use the same clock. ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE REALTIME means CLOCK_BOOTTIME; UNKNOWN
+// (the msm8994 camera HAL) means CLOCK_MONOTONIC, which stops during suspend: after a night of
+// suspend the two differ by hours and no frame would ever match a pulse.
+static std::atomic<int> gCameraClock{CLOCK_MONOTONIC};
+
+void setCameraClockRealtime(bool realtime) {
+    gCameraClock = realtime ? CLOCK_BOOTTIME : CLOCK_MONOTONIC;
+}
+
 int64_t boottimeNs() {
     struct timespec ts {};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
+    clock_gettime(gCameraClock.load(), &ts);
     return int64_t(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
