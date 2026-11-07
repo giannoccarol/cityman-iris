@@ -16,6 +16,7 @@
 // streaming; it is switched off on exit, on errors and on SIGINT/SIGTERM.
 // -x keeps the ISP colour pipeline (no CONTROL_EFFECT_MODE_MONO).
 // Run as root (the LED is a root-only sysfs file; cameraserver treats uid 0 as trusted).
+// Times are on CLOCK_MONOTONIC, the clock of the msm8994 camera timestamps (source UNKNOWN).
 
 #include <camera/NdkCameraCaptureSession.h>
 #include <camera/NdkCameraDevice.h>
@@ -96,12 +97,12 @@ struct FrameStat {
 };
 
 struct PulseTimes {
-    int64_t on_before, on_after, off_before, off_after;  // CLOCK_BOOTTIME ns around each write
+    int64_t on_before, on_after, off_before, off_after;  // CLOCK_MONOTONIC ns around each write
 };
 
 int64_t boottime_ns() {
     timespec t{};
-    clock_gettime(CLOCK_BOOTTIME, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t);
     return int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
 }
 
@@ -133,7 +134,7 @@ int64_t gT0 = 0;
 std::atomic<bool> gFirstFrame{false};
 void stamp(const char *what) {
     timespec t{};
-    clock_gettime(CLOCK_BOOTTIME, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t);
     int64_t now = int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
     if (getenv("IRIS_GRAB_TIMING")) std::fprintf(stderr, "t+%4lld ms %s\n", (long long)((now - gT0) / 1000000), what);
 }
@@ -283,7 +284,7 @@ void sleep_until_boottime(int64_t t) {
     timespec ts{};
     ts.tv_sec = t / 1000000000LL;
     ts.tv_nsec = t % 1000000000LL;
-    while (clock_nanosleep(CLOCK_BOOTTIME, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
     }
 }
 
@@ -424,7 +425,7 @@ int main(int argc, char **argv) {
 
     {
         timespec t{};
-        clock_gettime(CLOCK_BOOTTIME, &t);
+        clock_gettime(CLOCK_MONOTONIC, &t);
         gT0 = int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
     }
     if (!start_binder_pool()) std::fprintf(stderr, "warning: no binder thread pool\n");
